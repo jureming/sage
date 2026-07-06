@@ -1028,7 +1028,10 @@ def handle_host_result(host, value):
                 write_file(result_dir, host, result_content)
 
             if error_content:
-                write_file(error_dir, host, error_content)
+                if error_content == "no_stderr":
+                    write_file(error_dir, host, "")
+                else:
+                    write_file(error_dir, host, error_content)
 
             return
 
@@ -1175,7 +1178,7 @@ run_user_post() {
     set -e
 
     if [[ "$user_post_rc" -ne 0 ]]; then
-        echo "post 스크립트 실패: rc=$user_post_rc"
+        echo "post 스크립트 실패"
     else
         echo "post 스크립트 실행 완료"
     fi
@@ -1808,5 +1811,4 @@ case "$answer" in
         exit 0
         ;;
 esac
-
 
