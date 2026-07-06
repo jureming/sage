@@ -1,0 +1,1813 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+# ============================================================
+# 기본 파일 경로
+# ============================================================
+# log_dir        : 실행 산출물 로그 디렉토리
+# log            : Salt 실행 결과 JSON 로그
+# server_file    : 최종 실행 대상 서버 목록
+# completed      : 진행률 계산용 완료 서버 목록
+# async_jid_file : Salt JID 저장 파일
+# result_status  : JID missing 분류 임시 파일. post가 error 디렉토리로 반영
+# ============================================================
+log_dir="${log_dir:-$base_dir/log}"
+log="$log_dir/log_salt"
+server_file="$base_dir/server"
+completed="$base_dir/.tmp/completed"
+async_jid_file="$log_dir/async_jid"
+result_status="${RESULT_STATUS_FILE:-${tmp_dir:-$base_dir/.tmp}/result_status}"
+
+# ============================================================
+# 내부 기본값
+#
+# 아래 값들은 일반 사용자가 config에서 매번 수정할 필요 없는
+# 프레임워크 내부 튜닝값입니다.
+#
+# 필요하면 config에 같은 변수명을 선언해서 override 할 수 있습니다.
+# ============================================================
+TIMEOUT="${TIMEOUT:-3}"
+POLL_INTERVAL="${POLL_INTERVAL:-3}"
+RUNNING_CHECK_INTERVAL="${RUNNING_CHECK_INTERVAL:-30}"
+LATE_CHECK_TIMEOUT="${LATE_CHECK_TIMEOUT:-5}"
+LATE_CHECK_HARD_TIMEOUT="${LATE_CHECK_HARD_TIMEOUT:-15}"
+LOOKUP_HARD_TIMEOUT="${LOOKUP_HARD_TIMEOUT:-30}"
+FINAL_LOOKUP_HARD_TIMEOUT="${FINAL_LOOKUP_HARD_TIMEOUT:-300}"
+PING_CHECK_PARALLEL="${PING_CHECK_PARALLEL:-10}"
+PING_RETRY_COUNT="${PING_RETRY_COUNT:-2}"
+PING_RETRY_SLEEP="${PING_RETRY_SLEEP:-2}"
+DEBUG_MODE="${DEBUG_MODE:-false}"
+DEBUG_PRINT="${DEBUG_PRINT:-false}"
+DEBUG_LOG="${DEBUG_LOG:-$log_dir/debug.log}"
+
+mkdir -p "$base_dir/.tmp" "$log_dir"
+
+# 이전 로그 및 완료 목록 초기화
+rm -f "$log" "$async_jid_file" "$result_status"
+> "$completed"
+# result_status는 중간 분류가 하나도 없어도 debug/post 단계에서 참조될 수 있으므로
+# 빈 파일로 생성해 둔다.
+> "$result_status"
+
+# 디버그 모드일 때는 매 실행마다 debug.log를 초기화한다.
+case "${DEBUG_MODE:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        rm -f "$DEBUG_LOG"
+        ;;
+esac
+
+# ============================================================
+# Salt 실행 바이너리
+# ============================================================
+SALT_BIN="${SALT_BIN:-/usr/bin/salt}"
+SALT_RUN_BIN="${SALT_RUN_BIN:-/usr/bin/salt-run}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-$(command -v timeout 2>/dev/null || true)}"
+
+if [[ ! -x "$SALT_BIN" ]]; then
+    SALT_BIN="$(command -v salt 2>/dev/null || true)"
+fi
+
+if [[ ! -x "$SALT_RUN_BIN" ]]; then
+    SALT_RUN_BIN="$(command -v salt-run 2>/dev/null || true)"
+fi
+
+if [[ -z "$SALT_BIN" || ! -x "$SALT_BIN" ]]; then
+    echo "salt 명령을 찾을 수 없습니다."
+    SALT_RC=1
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit "$SALT_RC"
+    fi
+fi
+
+if [[ -z "$SALT_RUN_BIN" || ! -x "$SALT_RUN_BIN" ]]; then
+    echo "salt-run 명령을 찾을 수 없습니다."
+    SALT_RC=1
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit "$SALT_RC"
+    fi
+fi
+
+# ============================================================
+# true 값 판별 함수
+# ============================================================
+is_true_value() {
+    case "${1:-false}" in
+        true|TRUE|True|1|yes|YES|Yes|y|Y)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================
+# debug 로그 출력
+# ============================================================
+# - start.sh -d 또는 start.sh --debug 로 DEBUG_MODE/DEBUG_PRINT가 켜진다.
+# - DEBUG_MODE=true  : $log_dir/debug.log 에 기록
+# - DEBUG_PRINT=true : 터미널에도 실시간 출력
+# - 진행바가 한 줄 갱신을 사용하므로 터미널 출력 전에는 줄바꿈한다.
+# ============================================================
+debug_log() {
+    local msg="$*"
+    local now=""
+
+    if ! is_true_value "${DEBUG_MODE:-false}"; then
+        return 0
+    fi
+
+    now="$(date '+%F %T')"
+    printf '%s [DEBUG] %s
+' "$now" "$msg" >> "$DEBUG_LOG"
+
+    if is_true_value "${DEBUG_PRINT:-false}"; then
+        printf '
+%s [DEBUG] %s
+' "$now" "$msg"
+    fi
+}
+
+# ============================================================
+# 숫자 기본값 보정
+# ============================================================
+normalize_number() {
+    local value="${1:-}"
+    local default_value="$2"
+
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo "$default_value"
+    fi
+}
+
+# ============================================================
+# 명령 자체가 Salt timeout을 무시하고 멈추는 경우 방어
+# ============================================================
+# Salt의 --timeout은 minion return 대기 시간이지,
+# salt/salt-run 프로세스의 절대 실행 제한 시간이 아니다.
+# 따라서 late check, lookup_jid 같은 보조 조회는 OS 레벨 timeout으로 한 번 더 감싼다.
+# ============================================================
+run_with_hard_timeout() {
+    local hard_timeout="$1"
+    shift
+
+    if [[ -n "${TIMEOUT_BIN:-}" && -x "$TIMEOUT_BIN" && "$hard_timeout" =~ ^[0-9]+$ && "$hard_timeout" -gt 0 ]]; then
+        "$TIMEOUT_BIN" -k 2 "$hard_timeout" "$@"
+    else
+        "$@"
+    fi
+}
+
+# ============================================================
+# 진행률 출력 함수
+# ============================================================
+draw_progress() {
+    local done_count="$1"
+    local total_count="$2"
+    local width=40
+    local percent=0
+    local filled=0
+    local empty=0
+    local bar=""
+
+    if (( done_count < 0 )); then
+        done_count=0
+    fi
+
+    if (( done_count > total_count )); then
+        done_count="$total_count"
+    fi
+
+    if (( total_count > 0 )); then
+        percent=$(( done_count * 100 / total_count ))
+        filled=$(( done_count * width / total_count ))
+    fi
+
+    if (( filled < 0 )); then
+        filled=0
+    fi
+
+    if (( filled > width )); then
+        filled="$width"
+    fi
+
+    empty=$(( width - filled ))
+
+    if (( empty < 0 )); then
+        empty=0
+    fi
+
+    bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
+    bar="$bar$(printf '%*s' "$empty" '' | tr ' ' ' ')"
+
+    printf "\r[%-40s] %3d%% (%d/%d)" "$bar" "$percent" "$done_count" "$total_count"
+}
+
+# ============================================================
+# JID polling 진행률 출력 함수
+# - 기존 progress bar와 동일하게 carriage return(\r)으로 한 줄에서만 갱신한다.
+# - 터미널 폭이 좁아도 줄바꿈이 생기지 않도록 missing/elapsed는 진행바에 표시하지 않는다.
+# ============================================================
+draw_progress_line() {
+    local done_count="$1"
+    local total_count="$2"
+
+    if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
+        local total_done=0
+        local total_target=0
+
+        total_done=$(( ${JID_CHUNK_COMPLETED_BEFORE:-0} + done_count ))
+        total_target="${JID_CHUNK_TOTAL_TARGETS:-$total_count}"
+
+        draw_progress_with_prefix "${JID_CHUNK_LABEL:-0/0}" "$total_done" "$total_target"
+    else
+        draw_progress "$done_count" "$total_count"
+    fi
+}
+
+# ============================================================
+# 청크 prefix 포함 진행률 출력 함수
+# - JID_CHUNK_SIZE 모드에서 [1/8] 형태를 앞에 붙인다.
+# - 전체 대상 수 기준으로 진행률을 계산한다.
+# ============================================================
+draw_progress_with_prefix() {
+    local chunk_label="$1"
+    local done_count="$2"
+    local total_count="$3"
+    local width=40
+    local percent=0
+    local filled=0
+    local empty=0
+    local bar=""
+
+    if (( done_count < 0 )); then
+        done_count=0
+    fi
+
+    if (( done_count > total_count )); then
+        done_count="$total_count"
+    fi
+
+    if (( total_count > 0 )); then
+        percent=$(( done_count * 100 / total_count ))
+        filled=$(( done_count * width / total_count ))
+    fi
+
+    if (( filled < 0 )); then
+        filled=0
+    fi
+
+    if (( filled > width )); then
+        filled="$width"
+    fi
+
+    empty=$(( width - filled ))
+
+    if (( empty < 0 )); then
+        empty=0
+    fi
+
+    bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
+    bar="$bar$(printf '%*s' "$empty" '' | tr ' ' ' ')"
+
+    printf "\r[%s] [%-40s] %3d%% (%d/%d)" "$chunk_label" "$bar" "$percent" "$done_count" "$total_count"
+}
+
+# ============================================================
+# JSON 또는 일반 출력에서 JID 추출
+# ============================================================
+extract_jid_from_file() {
+    local input_file="$1"
+
+    python3 - "$input_file" <<'PY'
+import json
+import re
+import sys
+
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read()
+except FileNotFoundError:
+    data = ""
+
+
+def find_jid(value):
+    if isinstance(value, dict):
+        for key in ("jid", "JID"):
+            item = value.get(key)
+            if isinstance(item, str) and re.fullmatch(r"\d{10,}", item):
+                return item
+            if isinstance(item, int) and re.fullmatch(r"\d{10,}", str(item)):
+                return str(item)
+
+        for item in value.values():
+            found = find_jid(item)
+            if found:
+                return found
+
+    if isinstance(value, list):
+        for item in value:
+            found = find_jid(item)
+            if found:
+                return found
+
+    if isinstance(value, str) and re.fullmatch(r"\d{10,}", value):
+        return value
+
+    if isinstance(value, int) and re.fullmatch(r"\d{10,}", str(value)):
+        return str(value)
+
+    return ""
+
+
+decoder = json.JSONDecoder()
+idx = 0
+jid = ""
+
+while idx < len(data):
+    start = data.find("{", idx)
+
+    if start == -1:
+        break
+
+    try:
+        obj, end = decoder.raw_decode(data[start:])
+    except json.JSONDecodeError:
+        idx = start + 1
+        continue
+
+    jid = find_jid(obj)
+
+    if jid:
+        break
+
+    idx = start + end
+
+if not jid:
+    match = re.search(r"(?:job ID|jid)[^0-9]*(\d{10,})", data, re.IGNORECASE)
+    if match:
+        jid = match.group(1)
+
+if jid:
+    print(jid)
+PY
+}
+
+# ============================================================
+# server_file 전체 host 목록을 파일로 저장
+# - lookup_jid 자체가 계속 실패해서 missing 목록을 못 얻는 경우 방어
+# ============================================================
+write_all_target_hosts() {
+    local target_file="$1"
+    local out_file="$2"
+
+    awk 'NF && $1 !~ /^#/ {print $1}' "$target_file" | sort -u > "$out_file"
+}
+
+# ============================================================
+# lookup_jid missing=True JSON에서 missing host 목록 추출
+# - Salt 출력 앞뒤에 warning/log 문구가 섞여도 첫 번째 JSON dict만 찾아서 사용
+# - 파싱 실패를 0으로 오판하지 않도록 -1을 반환
+# ============================================================
+write_missing_hosts_from_json() {
+    local json_file="$1"
+    local target_file="$2"
+    local out_file="$3"
+    local parse_timeout=""
+    local parse_output=""
+    local parse_rc=0
+
+    parse_timeout="$(normalize_number "${JSON_PARSE_HARD_TIMEOUT:-5}" 5)"
+
+    set +e
+
+    parse_output="$(
+        run_with_hard_timeout "$parse_timeout" \
+            python3 - "$json_file" "$target_file" "$out_file" <<'PY_MISSING_JSON'
+import json
+import sys
+
+json_path = sys.argv[1]
+target_path = sys.argv[2]
+out_path = sys.argv[3]
+
+try:
+    with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+        targets = [line.strip().split()[0] for line in f if line.strip() and not line.lstrip().startswith("#")]
+except Exception:
+    targets = []
+
+target_set = set(targets)
+
+try:
+    with open(json_path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read()
+except Exception:
+    data = ""
+
+
+def first_json_object(text):
+    decoder = json.JSONDecoder()
+    idx = 0
+
+    while idx < len(text):
+        start = text.find("{", idx)
+
+        if start == -1:
+            break
+
+        try:
+            obj, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+
+        if isinstance(obj, dict):
+            return obj
+
+        idx = start + max(end, 1)
+
+    return None
+
+
+obj = first_json_object(data)
+
+if obj is None:
+    with open(out_path, "w", encoding="utf-8") as out:
+        pass
+    print(-1)
+    sys.exit(0)
+
+hosts = set()
+
+
+def add_from_missing_container(item):
+    if isinstance(item, list):
+        for entry in item:
+            if isinstance(entry, str) and entry in target_set:
+                hosts.add(entry)
+    elif isinstance(item, dict):
+        for entry in item.keys():
+            entry_str = str(entry)
+            if entry_str in target_set:
+                hosts.add(entry_str)
+
+
+stack = [obj]
+visited_count = 0
+max_visit_count = 100000
+
+while stack and visited_count < max_visit_count:
+    value = stack.pop()
+    visited_count += 1
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_str = str(key)
+
+            if key_str in target_set:
+                hosts.add(key_str)
+
+            lowered_key = key_str.lower().replace(" ", "_").replace("-", "_")
+
+            if lowered_key in (
+                "missing",
+                "missing_minions",
+                "not_returned",
+                "not_returned_minions",
+            ):
+                add_from_missing_container(item)
+
+            if isinstance(item, (dict, list)):
+                stack.append(item)
+
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                if item in target_set:
+                    hosts.add(item)
+            elif isinstance(item, (dict, list)):
+                stack.append(item)
+
+hosts = sorted(hosts)
+
+with open(out_path, "w", encoding="utf-8") as out:
+    for host in hosts:
+        out.write(host + "\n")
+
+print(len(hosts))
+PY_MISSING_JSON
+    )"
+
+    parse_rc=$?
+
+    set -e
+
+    if [[ "$parse_rc" -ne 0 ]]; then
+        : > "$out_file"
+        echo -1
+        return 0
+    fi
+
+    if [[ -z "$parse_output" ]]; then
+        : > "$out_file"
+        echo -1
+        return 0
+    fi
+
+    printf '%s\n' "$parse_output"
+}
+
+# ============================================================
+# 이미 조기 분류된 host를 missing 목록에서 제외
+# ============================================================
+filter_unclassified_hosts() {
+    local missing_hosts_file="$1"
+    local status_file="$2"
+    local out_file="$3"
+
+    python3 - "$missing_hosts_file" "$status_file" "$out_file" <<'PY'
+import sys
+
+missing_path = sys.argv[1]
+status_path = sys.argv[2]
+out_path = sys.argv[3]
+
+try:
+    with open(missing_path, "r", encoding="utf-8", errors="replace") as f:
+        missing = [line.strip() for line in f if line.strip()]
+except Exception:
+    missing = []
+
+classified = set()
+try:
+    with open(status_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if parts and parts[0]:
+                classified.add(parts[0])
+except Exception:
+    pass
+
+with open(out_path, "w", encoding="utf-8") as out:
+    for host in missing:
+        if host not in classified:
+            out.write(host + "\n")
+PY
+}
+
+# ============================================================
+# early check 결과 중 최종 실패로 볼 수 있는 상태만 result_status에 추가
+# - still_running 은 계속 대기 대상이므로 여기서는 제외한다.
+# - host 기준 중복은 첫 기록을 유지한다.
+# ============================================================
+append_non_running_status() {
+    local temp_status_file="$1"
+    local status_file="$2"
+    local dedup_file="$base_dir/.tmp/result_status_dedup"
+
+    if [[ ! -s "$temp_status_file" ]]; then
+        return 0
+    fi
+
+    awk -F '\t' '$2 != "still_running" {print}' "$temp_status_file" >> "$status_file"
+
+    awk -F '\t' '!seen[$1]++ {print}' "$status_file" > "$dedup_file"
+    mv "$dedup_file" "$status_file"
+}
+
+# ============================================================
+# early check 결과 중 조기 확정할 상태만 result_status에 추가
+# - minion_unreachable 은 ping retry 후에도 통신 실패한 것이므로 조기 제외한다.
+# - return_missing_not_running_candidate 는 Salt return 반영 지연일 수 있으므로
+#   JOB_WAIT_TIMEOUT까지 active missing으로 남겨 계속 재확인한다.
+# - still_running 은 계속 대기 대상이므로 제외한다.
+# ============================================================
+append_early_status() {
+    local temp_status_file="$1"
+    local status_file="$2"
+    local dedup_file="$base_dir/.tmp/result_status_dedup"
+
+    if [[ ! -s "$temp_status_file" ]]; then
+        return 0
+    fi
+
+    awk -F '\t' '$2 == "minion_unreachable" {print}' "$temp_status_file" >> "$status_file"
+
+    awk -F '\t' '!seen[$1]++ {print}' "$status_file" > "$dedup_file"
+    mv "$dedup_file" "$status_file"
+}
+
+# ============================================================
+# host 단위 test.ping 1회 확인
+# ============================================================
+# check_ping_hosts_individual()에서 병렬 실행하는 worker 함수다.
+# 각 host별로 별도 status 파일에 결과를 쓰므로 병렬 append 충돌이 없다.
+# 결과 파일 형식:
+#   <host>  ok
+#   <host>  bad
+# ============================================================
+check_ping_one_host() {
+    local host="$1"
+    local ping_work_dir="$2"
+    local safe_host=""
+    local out_file=""
+    local err_file=""
+    local status_file=""
+    local ping_rc=0
+    local retry_count=""
+    local retry_sleep=""
+    local attempt=0
+    local max_attempt=0
+    local ping_success=0
+    local final_rc=0
+
+    host="${host%%[[:space:]]*}"
+    safe_host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    out_file="$ping_work_dir/${safe_host}.json"
+    err_file="$ping_work_dir/${safe_host}.stderr"
+    status_file="$ping_work_dir/${safe_host}.status"
+
+    retry_count="$(normalize_number "${PING_RETRY_COUNT:-2}" 2)"
+    retry_sleep="$(normalize_number "${PING_RETRY_SLEEP:-2}" 2)"
+    max_attempt=$(( retry_count + 1 ))
+
+    while (( attempt < max_attempt )); do
+        attempt=$(( attempt + 1 ))
+
+        rm -f "$out_file" "$err_file"
+
+        set +e
+
+        run_with_hard_timeout "$late_check_hard_timeout" \
+            "$SALT_BIN" "$host" \
+                --timeout="$late_check_timeout" \
+                test.ping \
+                --out=json \
+                > "$out_file" 2> "$err_file"
+
+        ping_rc=$?
+        final_rc="$ping_rc"
+
+        set -e
+
+        if [[ "$ping_rc" -eq 0 ]] && python3 - "$host" "$out_file" <<'PY_PING_OK'
+import json
+import sys
+
+host = sys.argv[1]
+path = sys.argv[2]
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read()
+except Exception:
+    sys.exit(1)
+
+decoder = json.JSONDecoder()
+idx = 0
+obj = None
+
+while idx < len(data):
+    start = data.find("{", idx)
+    if start == -1:
+        break
+
+    try:
+        parsed, end = decoder.raw_decode(data[start:])
+    except json.JSONDecodeError:
+        idx = start + 1
+        continue
+
+    if isinstance(parsed, dict):
+        obj = parsed
+        break
+
+    idx = start + end
+
+if isinstance(obj, dict) and obj.get(host) is True:
+    sys.exit(0)
+
+sys.exit(1)
+PY_PING_OK
+        then
+            ping_success=1
+            break
+        fi
+
+        if (( attempt < max_attempt )); then
+            sleep "$retry_sleep"
+        fi
+    done
+
+    if (( ping_success == 1 )); then
+        printf '%s\tok\tattempt=%d\trc=%s\n' "$host" "$attempt" "$final_rc" > "$status_file"
+    else
+        printf '%s\tbad\tattempt=%d\trc=%s\n' "$host" "$attempt" "$final_rc" > "$status_file"
+    fi
+
+    return 0
+}
+
+# ============================================================
+# host 단위 test.ping 병렬 확인
+# ============================================================
+# Salt CLI는 죽은 minion이 섞이면 --timeout 값보다 오래 멈출 수 있다.
+# 그래서 missing 상태 점검에서는 -L 전체 묶음 ping 대신 host 단위로
+# OS hard timeout을 걸어 통신 정상 host와 비정상 host를 분리한다.
+#
+# 결과:
+#   ok_file  : test.ping True 를 반환한 host
+#   bad_file : test.ping 결과를 받지 못한 host 또는 True가 아닌 host
+# ============================================================
+check_ping_hosts_individual() {
+    local hosts_file="$1"
+    local ok_file="$2"
+    local bad_file="$3"
+    local ping_work_dir="$base_dir/.tmp/ping_check"
+    local host=""
+    local parallel_limit=""
+    local status_file=""
+    local status_host=""
+    local status_value=""
+    local status_detail=""
+
+    parallel_limit="$(normalize_number "${PING_CHECK_PARALLEL:-10}" 10)"
+
+    if (( parallel_limit < 1 )); then
+        parallel_limit=1
+    fi
+
+    rm -rf "$ping_work_dir"
+    mkdir -p "$ping_work_dir"
+    > "$ok_file"
+    > "$bad_file"
+
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        [[ "$host" =~ ^# ]] && continue
+
+        host="${host%%[[:space:]]*}"
+        check_ping_one_host "$host" "$ping_work_dir" &
+
+        # 현재 shell의 background job 수가 limit 이상이면 하나가 끝날 때까지 대기한다.
+        while (( $(jobs -pr | wc -l) >= parallel_limit )); do
+            wait -n 2>/dev/null || sleep 0.1
+        done
+    done < "$hosts_file"
+
+    wait || true
+
+    for status_file in "$ping_work_dir"/*.status; do
+        [[ -f "$status_file" ]] || continue
+
+        status_host=""
+        status_value=""
+        status_detail=""
+        IFS=$'\t' read -r status_host status_value status_detail < "$status_file" || true
+
+        [[ -z "$status_host" ]] && continue
+
+        if [[ "$status_value" == "ok" ]]; then
+            echo "$status_host" >> "$ok_file"
+        else
+            echo "$status_host" >> "$bad_file"
+        fi
+
+        # DEBUG 모드에서는 host별 ping 결과를 모두 기록한다.
+        # 예: ping_check host=mc77 result=ok attempt=1 rc=0
+        debug_log "ping_check host=$status_host result=$status_value ${status_detail}"
+    done
+
+    sort -u "$ok_file" -o "$ok_file"
+    sort -u "$bad_file" -o "$bad_file"
+}
+
+# ============================================================
+# 통신 상태 + find_job 결과 기반 missing host 분류
+# ============================================================
+# ping_bad_file 에 있는 host:
+#   - minion_unreachable 로 즉시 제외
+# ping_ok_file 에 있는 host:
+#   - find_job 결과 있음  -> still_running
+#   - find_job 결과 {}    -> return_missing_not_running
+#   - find_job 결과 없음/파싱불가
+#       early 모드: 판단 보류, 계속 대기
+#       final 모드: return_missing_unknown 으로 기록
+# ============================================================
+classify_by_ping_and_find_job() {
+    local jid="$1"
+    local active_hosts_file="$2"
+    local ping_ok_file="$3"
+    local ping_bad_file="$4"
+    local find_job_json="$5"
+    local status_file="$6"
+    local mode="${7:-early}"
+
+    python3 - "$jid" "$active_hosts_file" "$ping_ok_file" "$ping_bad_file" "$find_job_json" "$status_file" "$mode" <<'PY_CLASSIFY_PING_FIND'
+import json
+import sys
+
+jid = sys.argv[1]
+active_path = sys.argv[2]
+ping_ok_path = sys.argv[3]
+ping_bad_path = sys.argv[4]
+find_job_path = sys.argv[5]
+status_path = sys.argv[6]
+mode = sys.argv[7]
+
+
+def read_hosts(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [line.strip().split()[0] for line in f if line.strip() and not line.lstrip().startswith("#")]
+    except Exception:
+        return []
+
+
+
+active_hosts = read_hosts(active_path)
+ping_ok = set(read_hosts(ping_ok_path))
+ping_bad = set(read_hosts(ping_bad_path))
+
+
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except Exception:
+        return None
+
+    decoder = json.JSONDecoder()
+    idx = 0
+
+    while idx < len(data):
+        start = data.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(data[start:])
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = start + end
+
+    return None
+
+
+find_job = load_json(find_job_path)
+if not isinstance(find_job, dict):
+    find_job = {}
+
+
+def has_running_job(value):
+    if value is None:
+        return False
+    if value is False:
+        return False
+    if isinstance(value, dict):
+        return len(value) > 0
+    if isinstance(value, list):
+        return len(value) > 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if lowered in ("false", "none", "null", "{}", "[]"):
+            return False
+        if "minion did not return" in lowered:
+            return False
+        return True
+    return bool(value)
+
+
+with open(status_path, "w", encoding="utf-8") as out:
+    for host in active_hosts:
+        if host in ping_bad:
+            out.write(f"{host}\tminion_unreachable\tjid={jid}\n")
+            continue
+
+        if host not in ping_ok:
+            if mode == "final":
+                out.write(f"{host}\tminion_unreachable\tjid={jid}\n")
+            continue
+
+        if host not in find_job:
+            if mode == "final":
+                out.write(f"{host}\treturn_missing_unknown\tjid={jid}\n")
+            continue
+        value = find_job.get(host)
+
+        if has_running_job(value):
+            out.write(f"{host}\tstill_running\tjid={jid}\n")
+        else:
+            if mode == "early":
+                out.write(f"{host}\treturn_missing_not_running_candidate\tjid={jid}\n")
+            else:
+                out.write(f"{host}\treturn_missing_not_running\tjid={jid}\n")
+PY_CLASSIFY_PING_FIND
+}
+
+
+# ============================================================
+# status 파일 상세 debug 출력
+# ============================================================
+# classify_by_ping_and_find_job 결과를 host 단위로 debug.log에 기록한다.
+# 운영자가 상태를 바로 이해할 수 있도록 아래 형태로 출력한다.
+#
+# running:
+#   running host=mb80 ping=ok find_job=running action=keep_waiting
+#
+# pending:
+#   pending host=me6 ping=ok find_job=empty action=wait_for_final_return
+#
+# error candidate:
+#   error_candidate host=kapp03 reason=minion_unreachable ping=fail action=exclude
+# ============================================================
+debug_status_file() {
+    local label="$1"
+    local status_file="$2"
+    local host=""
+    local status=""
+    local detail=""
+
+    if ! is_true_value "${DEBUG_MODE:-false}"; then
+        return 0
+    fi
+
+    [[ -s "$status_file" ]] || return 0
+
+    while IFS=$'\t' read -r host status detail; do
+        [[ -z "$host" ]] && continue
+
+        case "$status" in
+            still_running)
+                debug_log "running host=$host ping=ok find_job=running action=keep_waiting ${detail}"
+                ;;
+            return_missing_not_running_candidate)
+                debug_log "pending host=$host ping=ok find_job=empty action=wait_for_final_return ${detail}"
+                ;;
+            minion_unreachable)
+                debug_log "error_candidate host=$host reason=minion_unreachable ping=fail action=exclude ${detail}"
+                ;;
+            return_missing_not_running)
+                debug_log "error_candidate host=$host reason=return_missing_not_running ping=ok find_job=empty action=exclude ${detail}"
+                ;;
+            return_missing_unknown)
+                debug_log "error_candidate host=$host reason=return_missing_unknown ping=ok find_job=unknown action=exclude ${detail}"
+                ;;
+            *)
+                debug_log "$label host=$host status=$status ${detail}"
+                ;;
+        esac
+    done < "$status_file"
+}
+
+# ============================================================
+# find_job hard timeout 또는 파싱 불가 시 ping OK host의 판단 보류를 debug에 기록
+# ============================================================
+debug_pending_find_job_hosts() {
+    local label="$1"
+    local hosts_file="$2"
+    local reason="$3"
+    local host=""
+
+    if ! is_true_value "${DEBUG_MODE:-false}"; then
+        return 0
+    fi
+
+    [[ -s "$hosts_file" ]] || return 0
+
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        debug_log "pending host=$host ping=ok find_job=unknown action=wait reason=$reason"
+    done < "$hosts_file"
+}
+
+# ============================================================
+# cmd.run + RUN_SCRIPT 처리
+# ============================================================
+# config에서 아래처럼 지정한 경우:
+#
+#   SALT_FUNCTION="cmd.run"
+#   SALT_ARGS=("__RUN_SCRIPT__")
+#   RUN_SCRIPT="$base_dir/remote"
+#
+# RUN_SCRIPT 파일 내용을 base64로 인코딩한 뒤,
+# 대상 서버에서 base64 -d | bash 형태로 실행한다.
+#
+# 추가:
+#   /data/salt/common/salt_framework_event_notify.sh 를
+#   RUN_SCRIPT 앞에 자동으로 붙여서 async remote에서도
+#   기존 post 방식과 비슷하게 message_send 를 사용할 수 있게 한다.
+#
+#   async remote 사용 예:
+#     webhook=$slack4
+#     message_send "$webhook" "$title" "$content"
+#
+# 주의:
+#   async remote 안에서는 아래 줄을 쓰지 않는다.
+#     . /data/salt/common/send_to_slack
+#
+# 이유:
+#   async remote 는 minion에서 실행되며, minion은 Slack webhook을
+#   직접 호출하지 않는다. message_send 는 salt-call event.send 로
+#   master event bus에 알림 데이터를 전달하고, master listener가
+#   실제 Slack 전송을 처리한다.
+# ============================================================
+if [[ "${SALT_FUNCTION:-}" == "cmd.run" && "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
+    EVENT_NOTIFY_LIB="${EVENT_NOTIFY_LIB:-$home_dir/common/salt_framework_event_notify.sh}"
+    RUN_SCRIPT_PAYLOAD="$tmp_dir/run_script_payload.sh"
+
+    if [[ ! -f "$RUN_SCRIPT" ]]; then
+        echo "RUN_SCRIPT 파일 없음: $RUN_SCRIPT"
+        SALT_RC=1
+        if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+            return 0
+        else
+            exit "$SALT_RC"
+        fi
+    fi
+
+    if [[ ! -s "$RUN_SCRIPT" ]]; then
+        echo "RUN_SCRIPT 파일이 비어있습니다: $RUN_SCRIPT"
+        SALT_RC=1
+        if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+            return 0
+        else
+            exit "$SALT_RC"
+        fi
+    fi
+
+    FRAMEWORK_RUN_ID="${FRAMEWORK_RUN_ID:-$(date '+%Y%m%d%H%M%S')_$$}"
+    FRAMEWORK_TASK_NAME="${FRAMEWORK_TASK_NAME:-$(basename "$base_dir")}"
+    FRAMEWORK_BASE_DIR="${FRAMEWORK_BASE_DIR:-$base_dir}"
+    FRAMEWORK_STARTED_AT="${FRAMEWORK_STARTED_AT:-$(date '+%F %T')}"
+    FRAMEWORK_STARTED_EPOCH="${FRAMEWORK_STARTED_EPOCH:-$(date +%s)}"
+    SLACK_EVENT_TAG="${SLACK_EVENT_TAG:-salt/framework/async/done}"
+
+    rm -f "$RUN_SCRIPT_PAYLOAD"
+
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# ============================================================'
+        echo '# Auto generated by salt_apply'
+        echo '# ============================================================'
+        echo
+
+        printf 'export FRAMEWORK_EXEC_MASTER=%q\n' "${FRAMEWORK_EXEC_MASTER:-}"
+        printf 'export FRAMEWORK_EXEC_MASTER_IPS=%q\n' "${FRAMEWORK_EXEC_MASTER_IPS:-}"
+        echo
+
+        if [[ -f "$EVENT_NOTIFY_LIB" && -s "$EVENT_NOTIFY_LIB" ]]; then
+            echo '# ============================================================'
+            echo '# Framework async slack event compatibility library'
+            echo '# ============================================================'
+            cat "$EVENT_NOTIFY_LIB"
+            echo
+        else
+            echo '# ============================================================'
+            echo '# Framework async slack event compatibility fallback'
+            echo '# ============================================================'
+            cat <<'FALLBACK_NOTIFY_LIB'
+for (( __salt_framework_slack_i=1; __salt_framework_slack_i<=99; __salt_framework_slack_i++ )); do
+    printf -v "slack${__salt_framework_slack_i}" '%s' "slack${__salt_framework_slack_i}"
+done
+unset __salt_framework_slack_i
+
+message_send() {
+    echo "message_send 사용 불가: EVENT_NOTIFY_LIB 파일이 없습니다." >&2
+    return 0
+}
+
+long_message_send() {
+    message_send "$@"
+}
+
+send_salt_slack_event() {
+    message_send "$@"
+}
+FALLBACK_NOTIFY_LIB
+            echo
+        fi
+
+        echo '# ============================================================'
+        echo '# User RUN_SCRIPT'
+        echo '# ============================================================'
+        cat "$RUN_SCRIPT"
+    } > "$RUN_SCRIPT_PAYLOAD"
+
+    encoded_script=$(base64 < "$RUN_SCRIPT_PAYLOAD" | tr -d '\n')
+
+    SALT_ARGS=(
+        "base64 -d | bash"
+        "stdin=$encoded_script"
+        "python_shell=True"
+    )
+
+    # cmd.run 은 per-minion 반환이 stdout 문자열뿐이라 RUN_SCRIPT(inner bash)의
+    # 종료코드가 유실된다 → post 파서가 문자열을 무조건 result/ 로 분류해 실패를
+    # 성공으로 오판한다. cmd.run_all 로 실행해 {stdout,stderr,retcode} dict 를 받아
+    # retcode 기반으로 정상/에러가 분류되도록 한다.
+    SALT_FUNCTION="cmd.run_all"
+fi
+
+# ============================================================
+# Salt 대상 옵션 구성
+# ============================================================
+# server_list가 "*" 이면 전체 대상 실행
+# 그 외에는 -L 옵션으로 comma-separated 서버 목록 지정
+# ============================================================
+SALT_TARGET_OPT=()
+
+if [[ "$server_list" == "*" ]]; then
+    SALT_TARGET_OPT=("*")
+else
+    SALT_TARGET_OPT=(-L "$server_list")
+fi
+
+# ============================================================
+# Salt 명령 옵션 구성
+# ============================================================
+# TIMEOUT이 설정되어 있으면 --timeout 옵션 추가
+# ============================================================
+SALT_CMD_OPT=()
+
+if [[ -n "${TIMEOUT:-}" ]]; then
+    SALT_CMD_OPT+=(--timeout="$TIMEOUT")
+fi
+
+# ============================================================
+# 실행 모드 판별
+# ============================================================
+ASYNC_MODE=0
+COLLECT_BY_JID_MODE=0
+
+if is_true_value "${ASYNC:-false}"; then
+    ASYNC_MODE=1
+fi
+
+if is_true_value "${COLLECT_BY_JID:-true}"; then
+    COLLECT_BY_JID_MODE=1
+fi
+
+# ============================================================
+# ASYNC=true 처리
+# ============================================================
+# ASYNC=true 이면:
+#   - salt --async 로 job만 등록
+#   - minion 결과를 기다리지 않음
+#   - BATCH(-b)는 사용하지 않음
+#   - 진행률 계산하지 않음
+#   - post 단계에서 result 파일 생성하지 않음
+#   - JID를 $log_dir/async_jid 에 저장
+# ============================================================
+if [[ "$ASYNC_MODE" -eq 1 ]]; then
+    echo "로그파일: $log"
+    echo "SALT START: $(date '+%F %T')"
+    echo "ASYNC MODE: true"
+
+    submit_log="$tmp_dir/async_submit"
+    rm -f "$submit_log"
+
+    set +e
+
+    PYTHONUNBUFFERED=1 stdbuf -oL -eL \
+    "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
+        "${SALT_CMD_OPT[@]}" \
+        --async \
+        --out=json \
+        "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
+        > "$submit_log" 2>&1
+
+    salt_rc=$?
+
+    set -e
+
+    cat "$submit_log" | tee -a "$log"
+
+    async_jid="$(extract_jid_from_file "$submit_log")"
+
+    if [[ -n "$async_jid" ]]; then
+        echo "$async_jid" > "$async_jid_file"
+        echo "ASYNC JID: $async_jid"
+    else
+        echo "ASYNC JID 확인 실패"
+    fi
+
+    echo "SALT END: $(date '+%F %T')"
+    echo "SALT RETCODE: $salt_rc"
+
+    if [[ "$salt_rc" -eq 0 && -n "$async_jid" ]]; then
+        SALT_RC=0
+    else
+        SALT_RC=1
+    fi
+
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit "$SALT_RC"
+    fi
+fi
+
+# ============================================================
+# COLLECT_BY_JID=true 처리
+# ============================================================
+# 일반 실행이지만 Salt stdout 전체를 실시간으로 기다리지 않는다.
+#   1. salt --async 로 JID 발급
+#   2. jobs.lookup_jid returned=False missing=True 로 진행률 계산
+#   3. timeout 이후 남은 서버는 find_job/test.ping 으로 분류
+#   4. jobs.lookup_jid returned=True missing=False 결과만 log_salt에 저장
+#   5. post 단계에서 log_salt + result_status 를 사용해 result 생성
+# ============================================================
+run_collect_by_jid_once() {
+    submit_log="$tmp_dir/jid_submit"
+    missing_json="$base_dir/.tmp/jid_missing.json"
+    missing_hosts="$base_dir/.tmp/jid_missing_hosts"
+    active_missing_hosts="$base_dir/.tmp/jid_active_missing_hosts"
+    find_job_json="$base_dir/.tmp/jid_find_job.json"
+    early_status_tmp="$base_dir/.tmp/jid_early_status"
+    final_stderr="$base_dir/.tmp/jid_final_stderr"
+    term_log="$base_dir/.tmp/jid_term_job.log"
+
+    rm -f \
+        "$submit_log" \
+        "$missing_json" \
+        "$missing_hosts" \
+        "$active_missing_hosts" \
+        "$find_job_json" \
+        "$early_status_tmp" \
+        "$final_stderr" \
+        "$term_log"
+
+    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+        echo "로그파일: $log"
+        echo "SALT START: $(date '+%F %T')"
+        echo "COLLECT_BY_JID: true"
+    fi
+
+    set +e
+
+    PYTHONUNBUFFERED=1 stdbuf -oL -eL \
+    "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
+        "${SALT_CMD_OPT[@]}" \
+        --async \
+        --out=json \
+        "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
+        > "$submit_log" 2>&1
+
+    submit_rc=$?
+
+    set -e
+
+    jid="$(extract_jid_from_file "$submit_log")"
+    debug_log "jid_submit rc=$submit_rc jid=$jid server_count=$server_count function=$SALT_FUNCTION args=${SALT_ARGS[*]}"
+
+    if [[ "$submit_rc" -ne 0 || -z "$jid" ]]; then
+        echo
+        echo "Salt JID 발급 실패"
+        echo "------------------------------------------------------------"
+        cat "$submit_log"
+        echo "------------------------------------------------------------"
+        echo "SALT END: $(date '+%F %T')"
+        echo "SALT RETCODE: $submit_rc"
+        SALT_RC=1
+
+        return 0
+    fi
+
+    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+        echo "$jid" > "$async_jid_file"
+    fi
+
+    if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
+        debug_log "jid_chunk_submit chunk=${JID_CHUNK_LABEL:-0/0} jid=$jid target_count=$server_count"
+    else
+        echo
+        echo "JID: $jid"
+    fi
+
+    poll_interval="$(normalize_number "${POLL_INTERVAL:-3}" 3)"
+    job_wait_timeout="$(normalize_number "${JOB_WAIT_TIMEOUT:-300}" 300)"
+    late_check_timeout="$(normalize_number "${LATE_CHECK_TIMEOUT:-5}" 5)"
+
+    # Salt --timeout 과 별개로 salt/salt-run 프로세스 자체를 강제 종료할 상한값
+    late_check_hard_timeout="$(normalize_number "${LATE_CHECK_HARD_TIMEOUT:-12}" 12)"
+    lookup_hard_timeout="$(normalize_number "${LOOKUP_HARD_TIMEOUT:-30}" 30)"
+    final_lookup_hard_timeout="$(normalize_number "${FINAL_LOOKUP_HARD_TIMEOUT:-300}" 300)"
+    running_check_interval="$(normalize_number "${RUNNING_CHECK_INTERVAL:-30}" 30)"
+
+    start_epoch="$(date +%s)"
+    last_running_check_epoch="$start_epoch"
+    missing_count="$server_count"
+    active_missing_count="$server_count"
+    last_progress_count=0
+
+    debug_log "poll_setup jid=$jid poll_interval=$poll_interval job_wait_timeout=$job_wait_timeout running_check_interval=$running_check_interval late_timeout=$late_check_timeout late_hard_timeout=$late_check_hard_timeout lookup_hard_timeout=$lookup_hard_timeout final_lookup_hard_timeout=$final_lookup_hard_timeout ping_parallel=$PING_CHECK_PARALLEL ping_retry=$PING_RETRY_COUNT ping_retry_sleep=$PING_RETRY_SLEEP"
+
+    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+        echo "진행률 확인중... poll=${poll_interval}s timeout=${job_wait_timeout}s"
+    fi
+    draw_progress_line 0 "$server_count"
+
+    while true; do
+        set +e
+
+        run_with_hard_timeout "$lookup_hard_timeout" \
+            "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
+                returned=False \
+                missing=True \
+                --out=json \
+                > "$missing_json" 2> "$base_dir/.tmp/jid_missing_stderr"
+
+        lookup_rc=$?
+
+
+        set -e
+        debug_log "lookup_jid rc=$lookup_rc jid=$jid"
+
+        if [[ "$lookup_rc" -ne 0 ]]; then
+            if (( job_wait_timeout > 0 )); then
+                now_epoch="$(date +%s)"
+                elapsed=$(( now_epoch - start_epoch ))
+
+                if (( elapsed >= job_wait_timeout )); then
+                    missing_count="$server_count"
+                    write_all_target_hosts "$server_file" "$missing_hosts"
+                    echo
+                    echo "JID 결과 조회 실패 timeout: ${job_wait_timeout}s"
+                    echo "미반환 서버 수: $missing_count"
+                    break
+                fi
+            fi
+
+            sleep "$poll_interval"
+            continue
+        fi
+
+        missing_count="$(write_missing_hosts_from_json "$missing_json" "$server_file" "$missing_hosts")"
+        debug_log "missing_parse missing_count=$missing_count missing_file=$missing_hosts"
+
+        if [[ "$missing_count" == "-1" ]]; then
+            if (( job_wait_timeout > 0 )); then
+                now_epoch="$(date +%s)"
+                elapsed=$(( now_epoch - start_epoch ))
+
+                if (( elapsed >= job_wait_timeout )); then
+                    missing_count="$server_count"
+                    write_all_target_hosts "$server_file" "$missing_hosts"
+                    echo
+                    echo "JID missing 결과 파싱 실패 timeout: ${job_wait_timeout}s"
+                    echo "미반환 서버 수: $missing_count"
+                    break
+                fi
+            fi
+
+            sleep "$poll_interval"
+            continue
+        fi
+
+        if [[ ! "$missing_count" =~ ^[0-9]+$ ]]; then
+            missing_count="$server_count"
+        fi
+
+        # 이미 minion_unreachable / return_missing_not_running 으로 조기 분류된 host는
+        # 더 이상 대기 대상(active missing)으로 보지 않는다.
+        filter_unclassified_hosts "$missing_hosts" "$result_status" "$active_missing_hosts"
+        active_missing_count="$(wc -l < "$active_missing_hosts")"
+        debug_log "active_missing active_missing_count=$active_missing_count result_status=$result_status"
+
+        if [[ ! "$active_missing_count" =~ ^[0-9]+$ ]]; then
+            active_missing_count="$missing_count"
+        fi
+
+        done_count=$(( server_count - active_missing_count ))
+
+        if (( done_count < 0 )); then
+            done_count=0
+        fi
+
+        if (( done_count > server_count )); then
+            done_count="$server_count"
+        fi
+
+        now_epoch="$(date +%s)"
+        elapsed=$(( now_epoch - start_epoch ))
+
+        if (( done_count != last_progress_count )); then
+            draw_progress_line "$done_count" "$server_count"
+            last_progress_count="$done_count"
+        fi
+
+        if (( active_missing_count == 0 )); then
+            missing_count=0
+            break
+        fi
+
+        # missing 서버가 남아 있으면 RUNNING_CHECK_INTERVAL 주기로 상태를 확인한다.
+        #   1) host 단위 병렬 test.ping 으로 통신 정상 여부 확인
+        #   2) 통신 비정상 host 는 minion_unreachable 로 조기 제외
+        #   3) 통신 정상 host 만 saltutil.find_job 으로 실제 실행 중인지 확인
+        #   4) still_running 은 계속 대기, find_job {} 은 return_missing_not_running 으로 제외
+        if (( running_check_interval > 0 )) && (( now_epoch - last_running_check_epoch >= running_check_interval )); then
+            last_running_check_epoch="$now_epoch"
+
+            if [[ -s "$active_missing_hosts" ]]; then
+                debug_log "early_check_start active_missing_count=$(wc -l < "$active_missing_hosts")"
+                ping_ok_hosts="$base_dir/.tmp/jid_ping_ok_hosts"
+                ping_bad_hosts="$base_dir/.tmp/jid_ping_bad_hosts"
+
+                check_ping_hosts_individual "$active_missing_hosts" "$ping_ok_hosts" "$ping_bad_hosts"
+                debug_log "ping_check_done ok=$(wc -l < "$ping_ok_hosts") bad=$(wc -l < "$ping_bad_hosts") parallel=$PING_CHECK_PARALLEL"
+
+                ping_ok_csv="$(paste -sd, "$ping_ok_hosts")"
+
+                rm -f "$find_job_json"
+                > "$find_job_json"
+
+                find_job_rc=0
+
+                if [[ -n "$ping_ok_csv" ]]; then
+                    set +e
+
+                    run_with_hard_timeout "$late_check_hard_timeout" \
+                        "$SALT_BIN" -L "$ping_ok_csv" \
+                            --timeout="$late_check_timeout" \
+                            saltutil.find_job "$jid" \
+                            --out=json \
+                            > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
+
+                    find_job_rc=$?
+
+                    set -e
+                    debug_log "find_job rc=$find_job_rc ping_ok_count=$(wc -l < "$ping_ok_hosts")"
+                fi
+
+                # find_job 자체가 hard timeout이면 ping_ok host 의 실행 상태는 판단 보류한다.
+                # 단, ping_bad host 는 이미 통신 비정상으로 확인되었으므로 minion_unreachable 로 조기 제외한다.
+                if [[ "$find_job_rc" -eq 124 || "$find_job_rc" -eq 137 ]]; then
+                    > "$early_status_tmp"
+                    awk -v jid="$jid" '{print $1 "\tminion_unreachable\tjid=" jid}' "$ping_bad_hosts" > "$early_status_tmp"
+                    debug_pending_find_job_hosts "early_classify" "$ping_ok_hosts" "find_job_hard_timeout"
+                else
+                    classify_by_ping_and_find_job "$jid" "$active_missing_hosts" "$ping_ok_hosts" "$ping_bad_hosts" "$find_job_json" "$early_status_tmp" "early"
+                fi
+
+                debug_status_file "early_classify" "$early_status_tmp"
+                append_early_status "$early_status_tmp" "$result_status"
+                confirmed_minion_unreachable_count="$(awk -F '\t' '$2 == "minion_unreachable" {c++} END {print c+0}' "$early_status_tmp" 2>/dev/null || echo 0)"
+                pending_wait_count="$(awk -F '\t' '$2 != "minion_unreachable" {c++} END {print c+0}' "$early_status_tmp" 2>/dev/null || echo 0)"
+                debug_log "early_check_result error_candidate=$confirmed_minion_unreachable_count pending_wait=$pending_wait_count result_status_count=$(wc -l < "$result_status" 2>/dev/null || echo 0)"
+
+                filter_unclassified_hosts "$missing_hosts" "$result_status" "$active_missing_hosts"
+                active_missing_count="$(wc -l < "$active_missing_hosts")"
+                done_count=$(( server_count - active_missing_count ))
+
+                if (( done_count < 0 )); then
+                    done_count=0
+                fi
+
+                if (( done_count > server_count )); then
+                    done_count="$server_count"
+                fi
+
+                if (( done_count != last_progress_count )); then
+                    draw_progress_line "$done_count" "$server_count"
+                    last_progress_count="$done_count"
+                fi
+                if (( active_missing_count == 0 )); then
+                    missing_count=0
+                    break
+                fi
+            fi
+        fi
+
+        if (( job_wait_timeout > 0 )); then
+            now_epoch="$(date +%s)"
+            elapsed=$(( now_epoch - start_epoch ))
+
+            if (( elapsed >= job_wait_timeout )); then
+                missing_count="$active_missing_count"
+                echo
+                echo "JID 결과 대기 timeout: ${job_wait_timeout}s"
+                echo "미반환 서버 수: $missing_count"
+                break
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    if (( missing_count > 0 )); then
+        if [[ ! -s "$missing_hosts" ]]; then
+            write_missing_hosts_from_json "$missing_json" "$server_file" "$missing_hosts" >/dev/null
+        fi
+
+        filter_unclassified_hosts "$missing_hosts" "$result_status" "$active_missing_hosts"
+        missing_count="$(wc -l < "$active_missing_hosts")"
+        missing_csv="$(paste -sd, "$active_missing_hosts")"
+
+        if [[ -n "$missing_csv" ]]; then
+            echo "미반환 서버 상태 확인중..."
+
+            ping_ok_hosts="$base_dir/.tmp/jid_ping_ok_hosts_final"
+            ping_bad_hosts="$base_dir/.tmp/jid_ping_bad_hosts_final"
+
+            check_ping_hosts_individual "$active_missing_hosts" "$ping_ok_hosts" "$ping_bad_hosts"
+            debug_log "final_ping_check_done ok=$(wc -l < "$ping_ok_hosts") bad=$(wc -l < "$ping_bad_hosts") parallel=$PING_CHECK_PARALLEL"
+
+
+           ping_ok_csv="$(paste -sd, "$ping_ok_hosts")"
+
+           rm -f "$find_job_json"
+           > "$find_job_json"
+           find_job_rc=0
+
+           if [[ -n "$ping_ok_csv" ]]; then
+               set +e
+
+               run_with_hard_timeout "$late_check_hard_timeout" \
+                   "$SALT_BIN" -L "$ping_ok_csv" \
+                       --timeout="$late_check_timeout" \
+                       saltutil.find_job "$jid" \
+                       --out=json \
+                       > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
+
+               find_job_rc=$?
+
+               set -e
+               debug_log "final_find_job rc=$find_job_rc ping_ok_count=$(wc -l < "$ping_ok_hosts")"
+
+               if [[ "$find_job_rc" -eq 124 || "$find_job_rc" -eq 137 ]]; then
+                   echo "saltutil.find_job hard timeout: ${late_check_hard_timeout}s"
+               fi
+           fi
+
+           if [[ "$find_job_rc" -eq 124 || "$find_job_rc" -eq 137 ]]; then
+               # 최종 분류 단계에서 find_job도 멈춘 경우:
+               # - 통신 비정상 host는 minion_unreachable
+               # - 통신 정상 host는 실행 상태를 확정할 수 없으므로 return_missing_unknown
+               {
+                   awk -v jid="$jid" '{print $1 "\tminion_unreachable\tjid=" jid}' "$ping_bad_hosts"
+                   awk -v jid="$jid" '{print $1 "\treturn_missing_unknown\tjid=" jid}' "$ping_ok_hosts"
+               } > "$early_status_tmp"
+           else
+               classify_by_ping_and_find_job "$jid" "$active_missing_hosts" "$ping_ok_hosts" "$ping_bad_hosts" "$find_job_json" "$early_status_tmp" "final"
+           fi
+
+           debug_status_file "final_classify" "$early_status_tmp"
+           cat "$early_status_tmp" >> "$result_status"
+           awk -F '\t' '!seen[$1]++ {print}' "$result_status" > "$base_dir/.tmp/result_status_dedup"
+           mv "$base_dir/.tmp/result_status_dedup" "$result_status"
+       fi
+   fi
+
+   if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+       echo
+       echo "JID 결과 최종 수집중..."
+   fi
+   debug_log "final_lookup_start jid=$jid hard_timeout=$final_lookup_hard_timeout"
+
+   set +e
+
+   run_with_hard_timeout "$final_lookup_hard_timeout" \
+       "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
+           returned=True \
+           missing=False \
+           --out=json \
+           > "$log" 2> "$final_stderr"
+
+   final_lookup_rc=$?
+
+   set -e
+   debug_log "final_lookup rc=$final_lookup_rc log_size=$(wc -c < "$log" 2>/dev/null || echo 0)"
+
+   if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+       echo "SALT END: $(date '+%F %T')"
+       echo "SALT RETCODE: $final_lookup_rc"
+   fi
+
+   if [[ "$final_lookup_rc" -eq 0 && -s "$log" ]] && grep -q '{' "$log"; then
+       SALT_RC=0
+   else
+       echo "JID 결과 수집 실패"
+       echo "stderr: $final_stderr"
+       SALT_RC=1
+   fi
+
+   if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
+       printf '%s\t%s\t%s\t%s\n' \
+           "${JID_CHUNK_LABEL:-0/0}" \
+           "$jid" \
+           "$server_count" \
+           "$SALT_RC" \
+           >> "$async_jid_file"
+   fi
+
+    return 0
+}
+
+# ============================================================
+# COLLECT_BY_JID=true + JID_CHUNK_SIZE 처리
+# ============================================================
+# Salt 기본 batch(-b)를 쓰지 않고, 최종 server 목록을 지정한 개수로
+# 분할한 뒤 각 묶음을 salt --async JID 단위로 순차 실행한다.
+# 각 chunk의 최종 lookup_jid 결과는 log/log_salt에 누적한다.
+# ============================================================
+run_collect_by_jid_chunked() {
+    local chunk_size="${JID_CHUNK_SIZE:-}"
+    local master_server_file="$server_file"
+    local master_server_list="$server_list"
+    local master_server_count="$server_count"
+    local master_log="$log"
+    local chunk_dir="$tmp_dir/jid_chunks"
+    local chunk_total=0
+    local chunk_no=0
+    local chunk_file=""
+    local chunk_count=0
+    local chunk_log=""
+    local chunk_label=""
+    local chunk_files=()
+
+    if [[ -z "$chunk_size" || ! "$chunk_size" =~ ^[0-9]+$ || "$chunk_size" -lt 1 ]]; then
+        echo "JID_CHUNK_SIZE 값이 올바르지 않습니다: ${JID_CHUNK_SIZE:-}"
+        SALT_RC=1
+        return 0
+    fi
+
+    rm -rf "$chunk_dir"
+    mkdir -p "$chunk_dir"
+    : > "$master_log"
+    : > "$async_jid_file"
+
+    split -l "$chunk_size" -d -a 4 "$master_server_file" "$chunk_dir/server_"
+    mapfile -t chunk_files < <(find "$chunk_dir" -maxdepth 1 -type f -name 'server_*' | sort)
+    chunk_total="${#chunk_files[@]}"
+
+    poll_interval="$(normalize_number "${POLL_INTERVAL:-3}" 3)"
+    job_wait_timeout="$(normalize_number "${JOB_WAIT_TIMEOUT:-300}" 300)"
+
+    echo "로그파일: $master_log"
+    echo "============================================================"
+    echo "JID 청크 실행 모드"
+    echo "============================================================"
+    echo "JID_CHUNK_SIZE: $chunk_size"
+    echo "전체 대상 수: $master_server_count"
+    echo "총 실행 횟수: $chunk_total"
+    echo "진행률 확인중... poll=${poll_interval}s timeout=${job_wait_timeout}s"
+    echo "------------------------------------------------------------"
+
+    JID_CHUNK_ACTIVE=1
+    JID_CHUNK_TOTAL_TARGETS="$master_server_count"
+    JID_CHUNK_COMPLETED_BEFORE=0
+
+    for chunk_file in "${chunk_files[@]}"; do
+        chunk_no=$(( chunk_no + 1 ))
+        chunk_label="${chunk_no}/${chunk_total}"
+        chunk_count="$(wc -l < "$chunk_file")"
+        chunk_log="$chunk_dir/log_salt_${chunk_no}"
+
+        server_file="$chunk_file"
+        server_list="$(paste -sd, "$chunk_file")"
+        server_count="$chunk_count"
+        log="$chunk_log"
+        JID_CHUNK_LABEL="$chunk_label"
+
+        if [[ "$server_list" == "*" ]]; then
+            SALT_TARGET_OPT=("*")
+        else
+            SALT_TARGET_OPT=(-L "$server_list")
+        fi
+
+        run_collect_by_jid_once
+
+        if [[ -s "$chunk_log" ]]; then
+            cat "$chunk_log" >> "$master_log"
+        fi
+
+        if [[ "${SALT_RC:-1}" -ne 0 ]]; then
+            echo
+            echo "JID 청크 실행 실패: $chunk_label"
+            break
+        fi
+
+        JID_CHUNK_COMPLETED_BEFORE=$(( JID_CHUNK_COMPLETED_BEFORE + chunk_count ))
+    done
+
+    echo
+    echo "JID 청크 실행 완료: ${chunk_no}/${chunk_total} 대상=${master_server_count} SALT_RETCODE=${SALT_RC:-1}"
+
+    server_file="$master_server_file"
+    server_list="$master_server_list"
+    server_count="$master_server_count"
+    log="$master_log"
+    JID_CHUNK_ACTIVE=0
+
+    if [[ "$server_list" == "*" ]]; then
+        SALT_TARGET_OPT=("*")
+    else
+        SALT_TARGET_OPT=(-L "$server_list")
+    fi
+}
+
+if [[ "$COLLECT_BY_JID_MODE" -eq 1 ]]; then
+    if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
+        run_collect_by_jid_chunked
+    else
+        run_collect_by_jid_once
+    fi
+
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit "${SALT_RC:-1}"
+    fi
+fi
+
+# ============================================================
+# 기존 stdout/log_salt 실시간 수집 방식
+# ============================================================
+# COLLECT_BY_JID=false 일 때만 사용한다.
+# ============================================================
+SALT_STREAM_OPT=("${SALT_TARGET_OPT[@]}")
+
+if [[ -n "${BATCH:-}" ]]; then
+    SALT_STREAM_OPT+=(-b "$BATCH")
+fi
+
+echo "로그파일: $log"
+echo "SALT START: $(date '+%F %T')"
+echo "COLLECT_BY_JID: false"
+
+draw_progress 0 "$server_count"
+
+# Salt 명령 실패 시에도 로그 파싱을 계속하기 위해 일시적으로 errexit 비활성화
+set +e
+
+PYTHONUNBUFFERED=1 stdbuf -oL -eL \
+"$SALT_BIN" "${SALT_STREAM_OPT[@]}" \
+    "${SALT_CMD_OPT[@]}" \
+    --out=json \
+    "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
+    2>&1 |
+while IFS= read -r line; do
+    # Salt 출력은 그대로 log_salt에 누적
+    printf '%s\n' "$line" >> "$log"
+
+    # JSON 출력 중 host key 라인을 찾아 완료 서버로 판단
+    host=$(
+        printf '%s\n' "$line" |
+            sed -n 's/^[[:space:]]*"\([^"]\+\)"[[:space:]]*:.*/\1/p'
+    )
+
+    # 추출한 host가 실행 대상 서버 목록에 있고,
+    # 아직 completed에 기록되지 않았다면 완료 처리
+    if [[ -n "$host" ]] && grep -Fxq "$host" "$server_file"; then
+        if ! grep -Fxq "$host" "$completed"; then
+            echo "$host" >> "$completed"
+            done_count=$(wc -l < "$completed")
+            draw_progress "$done_count" "$server_count"
+        fi
+    fi
+done
+
+# pipeline의 첫 번째 명령인 salt 명령의 exit code 저장
+salt_rc=${PIPESTATUS[0]}
+
+# 이후 단계에서 에러 발생 시 중단되도록 errexit 활성화
+set -e
+
+# 최종 진행률 재출력
+done_count=$(wc -l < "$completed")
+draw_progress "$done_count" "$server_count"
+
+echo
+echo "SALT END: $(date '+%F %T')"
+echo "SALT RETCODE: $salt_rc"
+
+# ============================================================
+# Salt 결과 로그 검증
+# ============================================================
+# log_salt 안에 JSON 시작 문자 "{"가 있으면 post 파싱 가능하다고 판단
+# 없으면 Salt 실행 결과가 없거나 파싱할 수 없는 상태로 판단
+# ============================================================
+if grep -q '{' "$log"; then
+    SALT_RC=0
+else
+    echo "log_salt에 JSON 결과가 없습니다."
+    SALT_RC=1
+fi
+
