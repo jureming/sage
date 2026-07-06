@@ -245,37 +245,12 @@ if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]] || (( TIMEOUT < 1 )); then
 fi
 
 # ============================================================
-# 실행 master 정보 확인
+# ASYNC_RESULT 실행 master 정보 확인
 # ============================================================
-# remote RUN_SCRIPT 안에서 message_send 계열 함수가 사용되는 경우에만
+# ASYNC_RESULT=true 인 경우 minion 완료 event를 실행 master로 보내야 하므로
 # sage를 실행한 master의 IP 후보 목록을 확인한다.
-#
-# 정책:
-#   1. message_send 계열 함수가 없으면 실행 master IP 확인을 하지 않는다.
-#   2. message_send 계열 함수가 있으면 hostname -I 결과 전체를 IP 후보 목록으로 사용한다.
-#   3. IP 대역은 하드코딩하지 않는다.
-#   4. hostname -I 는 최대 3회 재시도한다.
-#   5. 그래도 비어 있으면 event.send 대상 master를 결정할 수 없으므로 작업을 중단한다.
+# IP 대역은 하드코딩하지 않고 hostname -I 결과 전체를 사용한다.
 # ============================================================
-remote_run_script_uses_event_send() {
-    [[ "${SALT_FUNCTION:-}" == "cmd.run" ]] || return 1
-    [[ "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]] || return 1
-    [[ -n "${RUN_SCRIPT:-}" ]] || return 1
-    [[ -f "$RUN_SCRIPT" ]] || return 1
-
-    awk '
-        /^[[:space:]]*#/ { next }
-        /^[[:space:]]*$/ { next }
-        /^[[:space:]]*(message_send|long_message_send|send_salt_slack_event)([[:space:]]|\(|$)/ {
-            found = 1
-            exit
-        }
-        END {
-            exit found ? 0 : 1
-        }
-    ' "$RUN_SCRIPT"
-}
-
 detect_framework_exec_master_info() {
     local attempt=0
     local master_ips=""
@@ -321,7 +296,7 @@ detect_framework_exec_master_info() {
         sleep 1
     done
 
-    echo "FRAMEWORK_EXEC_MASTER_IPS 확인 실패: remote message_send 사용 작업이지만 hostname -I 결과가 비어있습니다."
+    echo "FRAMEWORK_EXEC_MASTER_IPS 확인 실패: remote event.send 사용 작업이지만 hostname -I 결과가 비어있습니다."
     echo "event.send 대상 master를 결정할 수 없어 작업을 중단합니다."
     exit 1
 }
@@ -443,6 +418,71 @@ case "${COLLECT_BY_JID:-true}" in
         echo "COLLECT_BY_JID 값이 올바르지 않습니다: ${COLLECT_BY_JID}"
         echo "사용 가능 값: true, false"
         exit 1
+        ;;
+esac
+
+# ============================================================
+# ASYNC_RESULT 옵션 검증
+# ============================================================
+# 기본값은 false다.
+# ASYNC_RESULT=true 는 ASYNC=true + cmd.run RUN_SCRIPT 모드에서만 사용한다.
+# 이 모드에서는 minion의 remote stdout/stderr/exit code를 event로 보내고,
+# master listener가 result/error를 생성한 뒤 post를 1회 실행한다.
+# ============================================================
+case "${ASYNC_RESULT:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        ;;
+    false|FALSE|False|0|no|NO|No|n|N|"")
+        ;;
+    *)
+        echo "ASYNC_RESULT 값이 올바르지 않습니다: ${ASYNC_RESULT}"
+        echo "사용 가능 값: true, false"
+        exit 1
+        ;;
+esac
+
+case "${ASYNC_RESULT:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        case "${ASYNC:-false}" in
+            true|TRUE|True|1|yes|YES|Yes|y|Y)
+                ;;
+            *)
+                echo "ASYNC_RESULT 는 ASYNC=true 모드에서만 사용할 수 있습니다."
+                echo
+                echo "사유:"
+                echo "  ASYNC_RESULT 는 비동기 Salt job의 결과를 event로 수집하는 옵션입니다."
+                echo "  ASYNC=false 모드에서는 기존 JID/stdout 수집 후 run_post()가 result/error를 생성합니다."
+                echo
+                echo "조치:"
+                echo "  1) async 결과 수집을 사용하려면 ASYNC=true 를 설정하세요."
+                echo "  2) 동기 실행을 사용하려면 ASYNC_RESULT 를 비우거나 false로 설정하세요."
+                exit 1
+                ;;
+        esac
+
+        if [[ "${SALT_FUNCTION:-}" != "cmd.run" || "${SALT_ARGS[0]:-}" != "__RUN_SCRIPT__" ]]; then
+            echo "ASYNC_RESULT 는 cmd.run + RUN_SCRIPT 모드에서만 사용할 수 있습니다."
+            echo
+            echo "필요 설정:"
+            echo '  SALT_FUNCTION="cmd.run"'
+            echo '  SALT_ARGS=("__RUN_SCRIPT__")'
+            echo '  RUN_SCRIPT="$base_dir/remote"'
+            exit 1
+        fi
+
+        if [[ -z "${EVENT_NOTIFY_LIB:-}" ]]; then
+            if [[ -s "$framework_dir/salt_framework_event_notify.sh" ]]; then
+                EVENT_NOTIFY_LIB="$framework_dir/salt_framework_event_notify.sh"
+            else
+                EVENT_NOTIFY_LIB="$home_dir/common/salt_framework_event_notify.sh"
+            fi
+        fi
+
+        if [[ ! -s "$EVENT_NOTIFY_LIB" ]]; then
+            echo "ASYNC_RESULT=true 모드는 EVENT_NOTIFY_LIB 파일이 필요합니다."
+            echo "파일 없음 또는 비어있음: $EVENT_NOTIFY_LIB"
+            exit 1
+        fi
         ;;
 esac
 
@@ -883,7 +923,7 @@ def stringify_value(value):
 
 
 def parse_cmd_dict(value):
-    """cmd.run_all 결과(dict)를 stdout/stderr/retcode 기준으로 정상/에러 분리한다."""
+    """cmd.run_all 결과(dict)를 stdout/stderr/retcode 기준으로 result/error 분리한다."""
     stdout = value.get("stdout")
     stderr = value.get("stderr")
     retcode = value.get("retcode")
@@ -891,20 +931,15 @@ def parse_cmd_dict(value):
     stdout = "" if stdout is None else str(stdout).rstrip()
     stderr = "" if stderr is None else str(stderr).rstrip()
 
-    # stderr가 있거나 retcode가 0이 아니면 error로 분리한다.
-    # 실패 사유 우선순위: stderr → 스크립트가 stdout에 echo한 메시지 → no_stderr.
-    # (cmd.run은 comment가 없고, remote 스크립트는 실패 사유를 보통 stdout에 출력한다.)
-    if stderr or retcode not in (None, 0, "0"):
-        if stderr:
-            return False, stderr
+    if stderr:
+        return stdout, stderr
+
+    if retcode not in (None, 0, "0"):
         if stdout:
-            return False, stdout
-        return False, "no_stderr"
+            return "", stdout
+        return "", "no_stderr"
 
-    # 정상 결과는 stdout만 저장한다.
-    # stdout이 없으면 빈 파일로 생성한다.
-    return True, stdout
-
+    return stdout, ""
 
 def parse_state_result(states):
     """state.apply/state.single 결과를 stdout/stderr/comment 기준으로 정상/에러 분리한다."""
@@ -987,11 +1022,14 @@ def handle_host_result(host, value):
     if isinstance(value, dict):
         # cmd.run dict 형태
         if any(key in value for key in ("stdout", "stderr", "retcode")):
-            ok, content = parse_cmd_dict(value)
-            if ok:
-                write_file(result_dir, host, content)
-            else:
-                write_file(error_dir, host, content)
+            result_content, error_content = parse_cmd_dict(value)
+
+            if result_content or value.get("retcode") in (None, 0, "0"):
+                write_file(result_dir, host, result_content)
+
+            if error_content:
+                write_file(error_dir, host, error_content)
+
             return
 
         # state.apply/state.single 형태로 간주
@@ -1003,7 +1041,6 @@ def handle_host_result(host, value):
         return
 
     write_file(result_dir, host, stringify_value(value))
-
 
 decoder = json.JSONDecoder()
 idx = 0
@@ -1533,9 +1570,13 @@ server_list=$(paste -sd, "$base_dir/server")
 server_count=$(wc -l < "$base_dir/server")
 skip_count=$(wc -l < "$log_dir/server_fail")
 
-if remote_run_script_uses_event_send; then
-    detect_framework_exec_master_info
-fi
+ASYNC_RESULT_MODE=0
+case "${ASYNC_RESULT:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        ASYNC_RESULT_MODE=1
+        detect_framework_exec_master_info
+        ;;
+esac
 
 
 jid_chunk_count=0
@@ -1598,9 +1639,20 @@ case "${ASYNC:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
         echo "▶ ASYNC=true"
         echo "Salt job만 등록하고 결과는 기다리지 않습니다."
-        echo "result/error 생성과 post 스크립트는 실행하지 않습니다."
+
+        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+            echo "▶ ASYNC_RESULT=true"
+            echo "remote stdout/stderr/exit code를 event로 수집합니다."
+            echo "result/error 생성과 post 실행은 listener가 처리합니다."
+        else
+            echo "▶ ASYNC_RESULT=false"
+            echo "result/error 생성과 post 스크립트는 실행하지 않습니다."
+        fi
         ;;
     *)
+        echo "▶ ASYNC=false"
+        echo "Salt 결과를 기다린 뒤 result/error를 생성하고 post를 실행합니다."
+
         case "${COLLECT_BY_JID:-true}" in
             true|TRUE|True|1|yes|YES|Yes|y|Y)
                 echo "▶ COLLECT_BY_JID=true"
@@ -1644,8 +1696,20 @@ echo "post 사용 모드"
 echo "============================================================"
 case "${ASYNC:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
-        echo "▶ post=false"
-        echo "ASYNC=true 이므로 result/error 생성과 post 스크립트 실행을 생략합니다."
+        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]] && post_has_effective_content "$base_dir/post"; then
+            echo "파일: $base_dir/post"
+            echo "------------------------------------------------------------"
+            echo "▶ post=true"
+            echo "ASYNC_RESULT 완료 event로 result/error가 모두 생성되면 post 스크립트를 1회 실행합니다."
+        else
+            echo "▶ post=false"
+
+            if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+                echo "post 파일이 없거나 주석/공백만 있어 실행하지 않습니다."
+            else
+                echo "ASYNC=true, ASYNC_RESULT=false 이므로 result/error 생성과 post 스크립트 실행을 생략합니다."
+            fi
+        fi
         ;;
     *)
         if post_has_effective_content "$base_dir/post"; then
@@ -1680,6 +1744,7 @@ case "$answer" in
         [[ -n "${BATCH:-}" ]] && export BATCH
         [[ -n "${TIMEOUT:-}" ]] && export TIMEOUT
         [[ -n "${ASYNC:-}" ]] && export ASYNC
+        [[ -n "${ASYNC_RESULT:-}" ]] && export ASYNC_RESULT
         [[ -n "${COLLECT_BY_JID:-}" ]] && export COLLECT_BY_JID
         [[ -n "${JID_CHUNK_SIZE:-}" ]] && export JID_CHUNK_SIZE
         [[ -n "${POLL_INTERVAL:-}" ]] && export POLL_INTERVAL
@@ -1743,3 +1808,5 @@ case "$answer" in
         exit 0
         ;;
 esac
+
+

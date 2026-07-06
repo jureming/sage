@@ -11,3 +11,4 @@ if [[ ! -f "$start_file" ]]; then
 fi
 
 exec /bin/bash "$start_file" "$@"
+
