@@ -308,7 +308,7 @@ def handle_async_done(payload):
     #
     # 2. stderr 가 없고 실패이면:
     #    - stdout 이 있으면 error 에만 저장
-    #    - stdout 도 없으면 error=no_stderr
+    #    - stdout 도 없으면 빈 error 파일 생성
     #
     # 3. 성공이면:
     #    - stdout 을 result 에 저장
@@ -327,7 +327,7 @@ def handle_async_done(payload):
         if stdout_content:
             write_text_file(error_file, stdout_content)
         else:
-            write_text_file(error_file, "no_stderr")
+            write_text_file(error_file, "")
 
         wrote_error = True
 
@@ -418,5 +418,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
