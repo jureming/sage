@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+home_dir="/data/salt"
+framework_dir="$home_dir/common/salt_framework"
+start_file="$framework_dir/start.sh"
+
+if [[ ! -f "$start_file" ]]; then
+    echo "start.sh 파일 없음: $start_file"
+    exit 1
+fi
+
+exec /bin/bash "$start_file" "$@"
