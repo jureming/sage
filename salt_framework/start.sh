@@ -20,10 +20,10 @@ init_target=""
 #
 # 사용 예:
 #   sage -y
-#   sage -y manual/108231ju/sample
+#   sage -y cron/작업분류/작업명
 #
 # cron 예:
-#   * * * * /usr/local/bin/sage -y manual/108231ju/sample
+#   * * * * /usr/local/bin/sage -y cron/작업분류/작업명
 #
 # 중요한 점:
 #   - framework_dir은 공통 프레임워크 소스 위치다.
@@ -33,15 +33,18 @@ init_target=""
 #
 # config 로드 후 기준 경로:
 #   $base_dir/config
-#   $framework_dir/salt_apply
+#   $base_dir/local
+#   $base_dir/remote
 #   $base_dir/post
 #   $base_dir/server
+#   $framework_dir/salt_apply
 #   $base_dir/log/server_fail
 #   $base_dir/log/log_salt
 #   $base_dir/log/async_jid
 #   $base_dir/log/debug.log
 #   $base_dir/.tmp/result_status
 #   $base_dir/result/*
+#   $base_dir/error/*
 # ============================================================
 
 # ============================================================
@@ -64,8 +67,10 @@ target_path="${SAGE_BASE_DIR:-}"
 # ============================================================
 print_usage() {
     echo "사용법: sage [-y|--yes] [--keep-tmp] [-d|--debug] [-i|--init <작업경로>] [manual/작업분류/작업명|cron/작업분류/작업명|절대경로]"
-    echo "  경로 생략 시 현재 디렉토리를 작업 디렉토리로 사용합니다."
-    echo "  -y, --yes            : 실행 확인 질문 없이 바로 실행합니다."
+	echo
+	echo "  경로 생략 시 현재 디렉토리를 작업 디렉토리로 사용합니다."
+    echo
+	echo "  -y, --yes            : 실행 확인 질문 없이 바로 실행합니다."
     echo "  --keep-tmp           : 종료 후 .tmp 디렉토리를 삭제하지 않습니다."
     echo "  -d, --debug          : 디버그 모드 활성화(debug.log 기록 + 화면 출력)."
     echo "  -i, --init <작업명>  : sample 디렉토리를 복사해 새 작업 디렉토리를 생성합니다."
@@ -213,6 +218,63 @@ base_dir="$(cd "$target_dir" && pwd)"
 config_file="$base_dir/config"
 
 # ============================================================
+# 작업 파일 Bash 문법 검사
+# ============================================================
+# config/local/remote/post는 Bash 기반 파일이므로
+# config source 및 server/minion 처리 전에 bash -n으로 검사한다.
+# 하나라도 문법 오류가 있으면 전체 오류를 출력한 뒤 실행을 중단한다.
+# ============================================================
+validate_job_bash_syntax() {
+    local -a check_names=("config" "local" "remote" "post")
+    local -a error_names=()
+    local -a error_messages=()
+    local name=""
+    local file=""
+    local syntax_error=""
+    local line=""
+    local i=0
+    local first_line=0
+
+    for name in "${check_names[@]}"; do
+        file="$base_dir/$name"
+
+        # config는 아래에서 필수 파일 여부를 별도로 검사한다.
+        # local/remote/post는 파일이 있을 때만 문법 검사한다.
+        [[ -f "$file" ]] || continue
+
+        if ! syntax_error="$(bash -n "$file" 2>&1)"; then
+            error_names+=("$name")
+            error_messages+=("$syntax_error")
+        fi
+    done
+
+    if (( ${#error_names[@]} == 0 )); then
+        return 0
+    fi
+
+    echo
+    echo "[ bash -n 오류 ]"
+
+    for (( i=0; i<${#error_names[@]}; i++ )); do
+        first_line=1
+
+        while IFS= read -r line; do
+            if [[ "$first_line" -eq 1 ]]; then
+                printf '%-7s: %s\n' "${error_names[$i]}" "$line"
+                first_line=0
+            else
+                printf '         %s\n' "$line"
+            fi
+        done <<< "${error_messages[$i]}"
+
+        echo
+    done
+
+    echo "Bash 문법 오류가 있어 sage 실행을 중단합니다."
+    exit 1
+}
+
+# ============================================================
 # config 로드 및 필수 변수 검증
 # ============================================================
 if [[ ! -f "$config_file" ]]; then
@@ -220,9 +282,103 @@ if [[ ! -f "$config_file" ]]; then
     exit 1
 fi
 
+# config/local/remote/post Bash 문법 검사
+# 오류가 있으면 config source 전에 실행을 중단한다.
+validate_job_bash_syntax
+
+# ============================================================
+# config 직접 선언 옵션 확인
+# ============================================================
+# start.sh와 salt_apply에서 ${OPTION:-기본값} 형태로 사용하는
+# 대문자 변수를 자동으로 찾는다.
+#
+# 이후 config에 직접 선언된 변수와 비교하여,
+# 사용자가 config에 설정한 실행 옵션만 [ 실행 모드 ]에 출력한다.
+#
+# 신규 옵션이 프레임워크 소스에 추가돼도
+# 별도의 옵션 목록을 수정할 필요가 없다.
+# ============================================================
+declare -A framework_config_option_set=()
+declare -A config_declared_values=()
+
+declare -a config_assigned_names=()
+declare -a config_declared_options=()
+
+prepare_config_option_detection() {
+    local option_name=""
+
+    # start.sh와 salt_apply에서
+    # ${OPTION:-기본값}, ${OPTION:=기본값} 등의 형태로
+    # 사용되는 대문자 변수명을 자동 추출한다.
+    while IFS= read -r option_name; do
+        [[ -z "$option_name" ]] && continue
+
+        framework_config_option_set["$option_name"]=1
+    done < <(
+        grep -hoE \
+            '\$\{[A-Z][A-Z0-9_]*:[-+=?]' \
+            "$framework_dir/start.sh" \
+            "$framework_dir/salt_apply" \
+            2>/dev/null \
+            | sed -E 's/^\$\{([A-Z][A-Z0-9_]*):.*/\1/' \
+            | sort -u
+    )
+
+    # 작업 실행 정의값은 실행 옵션 목록에서 제외한다.
+    unset 'framework_config_option_set[SALT_FUNCTION]'
+    unset 'framework_config_option_set[SALT_ARGS]'
+    unset 'framework_config_option_set[RUN_SCRIPT]'
+
+    # config에 직접 선언된 대문자 변수명을
+    # config 작성 순서대로 추출한다.
+    mapfile -t config_assigned_names < <(
+        sed -nE \
+            's/^[[:space:]]*(export[[:space:]]+)?([A-Z][A-Z0-9_]*)[[:space:]]*=.*/\2/p' \
+            "$config_file" \
+            | awk '!seen[$0]++'
+    )
+}
+
+capture_config_declared_options() {
+    local option_name=""
+
+    for option_name in "${config_assigned_names[@]}"; do
+        # 프레임워크 소스에서 실제 옵션 형태로 사용되지 않으면 제외한다.
+        if [[ -z "${framework_config_option_set[$option_name]:-}" ]]; then
+            continue
+        fi
+
+        config_declared_options+=("$option_name")
+
+        # config source 직후 값을 저장한다.
+        # 이후 JID_CHUNK_SIZE=0 등이 내부에서 빈 값으로 변경돼도
+        # config에 사용자가 설정한 값을 그대로 출력할 수 있다.
+        config_declared_values["$option_name"]="${!option_name-}"
+    done
+}
+
+# config source 전에
+# 프레임워크 옵션 목록과 config 선언 변수 목록을 확인한다.
+prepare_config_option_detection
+
+# config 로드
 source "$config_file"
 
-# config에 같은 변수가 남아 있어도 무시하고 sage/start.sh 기준값으로 강제 고정
+# config에 직접 설정한 실행 옵션 값을 저장한다.
+capture_config_declared_options
+
+# config에 JID_CHUNK_SIZE를 직접 선언했는지 확인
+jid_chunk_size_declared=0
+
+if grep -Eq \
+    '^[[:space:]]*(export[[:space:]]+)?JID_CHUNK_SIZE[[:space:]]*=' \
+    "$config_file"
+then
+    jid_chunk_size_declared=1
+fi
+
+# config에 같은 변수가 남아 있어도 무시하고
+# sage/start.sh 기준값으로 강제 고정한다.
 base_dir="$(cd "$target_dir" && pwd)"
 home_dir="/data/salt"
 apply_dir="$home_dir/apply"
@@ -366,7 +522,8 @@ DEBUG_LOG="${DEBUG_LOG:-$log_dir/debug.log}"
 #
 # 이 파일에 있는 host는 최종 실행 대상 server에서 제외하고,
 # $log_dir/server_fail 에 <host>    dirty_nodes 형태로 기록한다.
-# config에는 노출하지 않지만, 필요하면 DIRTY_NODES_FILE 변수로 경로 override 가능.
+# 기본 경로는 /data/salt/common/dirty_nodes이며,
+# config에 DIRTY_NODES_FILE을 선언하면 경로를 변경할 수 있다.
 # ============================================================
 dirty_nodes_file="${DIRTY_NODES_FILE:-$home_dir/common/dirty_nodes}"
 
@@ -426,8 +583,10 @@ esac
 # ============================================================
 # 기본값은 false다.
 # ASYNC_RESULT=true 는 ASYNC=true + cmd.run RUN_SCRIPT 모드에서만 사용한다.
-# 이 모드에서는 minion의 remote stdout/stderr/exit code를 event로 보내고,
-# master listener가 result/error를 생성한 뒤 post를 1회 실행한다.
+# salt_apply의 framework wrapper가 remote의 stdout/stderr/exit code를
+# 자동으로 수집해 event로 전송한다.
+# remote에서는 event 전송 함수를 직접 호출하지 않는다.
+# master listener는 result/error를 생성하고 전체 완료 후 post를 1회 실행한다.
 # ============================================================
 case "${ASYNC_RESULT:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
@@ -490,13 +649,15 @@ esac
 # JID_CHUNK_SIZE 옵션 검증
 #
 # JID_CHUNK_SIZE
-#   - 비어있거나 0이면 기존 동작
-#   - 양의 정수이면 최종 server 목록을 지정한 개수만큼 나눠
-#     JID 기반으로 순차 실행
+#   - config에 비어있거나 0으로 선언하면 청크 실행을 사용하지 않는다.
+#   - config에 양의 정수를 선언하면 해당 개수 단위로 나눠 실행한다.
+#   - config에 선언하지 않았고 최종 실행 대상이 200대를 초과하면
+#     JID_CHUNK_SIZE=200을 자동 적용한다.
+#   - 최종 server 목록을 청크 단위로 나눠 JID 기반으로 순차 실행한다.
 #
 # 제한:
-#   - ASYNC=true 와 같이 사용할 수 없다.
-#   - COLLECT_BY_JID=false 와 같이 사용할 수 없다.
+#   - ASYNC=true와 같이 사용할 수 없다.
+#   - COLLECT_BY_JID=false와 같이 사용할 수 없다.
 # ============================================================
 case "${JID_CHUNK_SIZE:-}" in
     ""|0)
@@ -567,36 +728,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ============================================================
-# 파일 미리보기 출력 함수
-# - state.apply SLS 내용
-# - cmd.run 스크립트 내용
-# 등을 실행 전 확인용으로 출력
-# ============================================================
-show_file_preview() {
-    local title="$1"
-    local file="$2"
-    local max_lines="${3:-80}"
-    local line_count
-
-    line_count=$(wc -l < "$file")
-
-    echo
-    echo "============================================================"
-    echo "$title"
-    echo "============================================================"
-    echo "파일: $file"
-    echo "------------------------------------------------------------"
-    head -n "$max_lines" "$file"
-
-    if (( line_count > max_lines )); then
-        echo "..."
-        echo "[INFO] ${max_lines}줄까지만 표시"
-    fi
-
-    #echo "------------------------------------------------------------"
-}
-
-# ============================================================
 # SLS 파일 경로 찾기
 # 예:
 #   sample       -> $apply_dir/sample/init.sls
@@ -661,24 +792,26 @@ validate_salt_sources_in_sls() {
 }
 
 # ============================================================
-# 실행 전 작업 검증 및 미리보기
+# 실행 전 작업 검증
 # 지원 SALT_FUNCTION:
 #   - state.apply
 #   - cmd.run
 #   - state.single
 # ============================================================
-validate_and_preview_job() {
+validate_job() {
     case "$SALT_FUNCTION" in
         state.apply)
-            local sls_name="${SALT_ARGS[0]}"
-            local sls_file
+            local sls_name="${SALT_ARGS[0]:-}"
+            local sls_file=""
+
+            if [[ -z "$sls_name" ]]; then
+                echo "state.apply 대상 SLS 이름이 없습니다."
+                exit 1
+            fi
 
             # state.apply 대상 SLS 파일 존재 여부 확인
-            if ! sls_file=$(find_sls_file "$sls_name"); then
-                echo
-                echo "SLS 파일 없음"
-                echo "확인 경로:"
-                echo "  $apply_dir/${sls_name}/init.sls"
+            if ! sls_file="$(find_sls_file "$sls_name")"; then
+                echo "SLS 파일 없음: $apply_dir/${sls_name//./\/}/init.sls"
                 exit 1
             fi
 
@@ -689,14 +822,15 @@ validate_and_preview_job() {
 
             # SLS 내부 salt:// source 파일 사전 검증
             validate_salt_sources_in_sls "$sls_file"
-
-            # 실행 전 SLS 내용 미리보기
-            show_file_preview "state.apply 모드" "$sls_file"
-            echo
             ;;
 
         cmd.run)
-            # __RUN_SCRIPT__ 모드는 RUN_SCRIPT 파일 내용을 대상 서버에서 실행
+            if (( ${#SALT_ARGS[@]} == 0 )); then
+                echo "cmd.run 실행 인자가 없습니다."
+                exit 1
+            fi
+
+            # __RUN_SCRIPT__ 모드는 RUN_SCRIPT 파일을 대상 서버에서 실행
             if [[ "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
                 if [[ -z "${RUN_SCRIPT:-}" ]]; then
                     echo "RUN_SCRIPT 변수가 없습니다."
@@ -711,123 +845,67 @@ validate_and_preview_job() {
                 if [[ ! -s "$RUN_SCRIPT" ]]; then
                     echo "RUN_SCRIPT 파일이 비어있습니다: $RUN_SCRIPT"
                     exit 1
-               fi
-
-               # 실행 전 스크립트 내용 미리보기
-               show_file_preview "cmd.run 모드" "$RUN_SCRIPT"
-           else
-               # 일반 cmd.run 명령어 출력
-               echo
-               echo "============================================================"
-               echo "cmd.run 모드"
-               echo "============================================================"
-               printf '%s\n' "${SALT_ARGS[@]}"
-               #echo "------------------------------------------------------------"
-           fi
-
-           echo
-           ;;
-
-       state.single)
-           local state_mod="${SALT_ARGS[0]:-}"
-
-           # state.single file.managed 전용 검증 및 출력
-           if [[ "$state_mod" == "file.managed" ]]; then
-               local src=""
-               local dst=""
-               local src_file=""
-               local mode=""
-               local user=""
-               local group=""
-               local makedirs=""
-               local replace=""
-
-               # SALT_ARGS 배열에서 file.managed 인자 추출
-               for arg in "${SALT_ARGS[@]}"; do
-                   case "$arg" in
-                       name=*) dst="${arg#name=}" ;;
-                       source=*) src="${arg#source=}" ;;
-                       mode=*) mode="${arg#mode=}" ;;
-                       user=*) user="${arg#user=}" ;;
-                       group=*) group="${arg#group=}" ;;
-                       makedirs=*) makedirs="${arg#makedirs=}" ;;
-                       replace=*) replace="${arg#replace=}" ;;
-                   esac
-               done
-
-               if [[ -z "$dst" ]]; then
-                   echo "state.single file.managed 에 name= 값이 없습니다."
-                   exit 1
-               fi
-
-               if [[ -z "$src" ]]; then
-                   echo "state.single file.managed 에 source= 값이 없습니다."
-                   exit 1
-               fi
-
-               if [[ "$src" != salt://* ]]; then
-                   echo "현재 검증은 salt:// source 만 지원합니다: $src"
-                   exit 1
-               fi
-
-               # salt:// source를 실제 Master 파일 경로로 변환 후 검증
-               src_file=$(salt_source_to_file "$src")
-
-               if [[ ! -f "$src_file" ]]; then
-                   echo "source 파일 없음: $src_file"
-                   exit 1
-               fi
-
-               if [[ ! -s "$src_file" ]]; then
-                   echo "source 파일이 비어있습니다: $src_file"
-                   exit 1
-               fi
-
-               # file.managed 실행 예정 내용을 SLS 형태로 출력
-               echo
-               echo "============================================================"
-               echo "state.single file.managed 모드"
-                echo "============================================================"
-                echo "file.managed:"
-                echo "  - name: $dst"
-                echo "  - source: $src"
-
-                if [[ -n "$mode" ]]; then
-                    echo "  - mode: '$mode'"
                 fi
+            fi
+            ;;
 
-                if [[ -n "$user" ]]; then
-                    echo "  - user: $user"
-                fi
+        state.single)
+            local state_mod="${SALT_ARGS[0]:-}"
+            local src=""
+            local dst=""
+            local src_file=""
+            local arg=""
 
-                if [[ -n "$group" ]]; then
-                    echo "  - group: $group"
-                fi
-
-                if [[ -n "$makedirs" ]]; then
-                    echo "  - makedirs: $makedirs"
-                fi
-
-                if [[ -n "$replace" ]]; then
-                    echo "  - replace: $replace"
-                fi
-
-                #echo "------------------------------------------------------------"
-            else
-                # file.managed 외 state.single은 인자만 출력
-                echo
-                echo "============================================================"
-                echo "state.single 모드"
-                echo "============================================================"
-                printf '%s\n' "${SALT_ARGS[@]}"
-                #echo "------------------------------------------------------------"
+            if [[ -z "$state_mod" ]]; then
+                echo "state.single 실행 모듈이 없습니다."
+                exit 1
             fi
 
-            echo
+            # state.single file.managed 전용 검증
+            if [[ "$state_mod" == "file.managed" ]]; then
+                for arg in "${SALT_ARGS[@]}"; do
+                    case "$arg" in
+                        name=*)
+                            dst="${arg#name=}"
+                            ;;
+                        source=*)
+                            src="${arg#source=}"
+                            ;;
+                    esac
+                done
+
+                if [[ -z "$dst" ]]; then
+                    echo "state.single file.managed에 name= 값이 없습니다."
+                    exit 1
+                fi
+
+                if [[ -z "$src" ]]; then
+                    echo "state.single file.managed에 source= 값이 없습니다."
+                    exit 1
+                fi
+
+                if [[ "$src" != salt://* ]]; then
+                    echo "현재 source 검증은 salt:// 경로만 지원합니다: $src"
+                    exit 1
+                fi
+
+                # salt:// source를 실제 master 파일 경로로 변환
+                src_file="$(salt_source_to_file "$src")"
+
+                if [[ ! -f "$src_file" ]]; then
+                    echo "source 파일 없음: $src_file"
+                    exit 1
+                fi
+
+                if [[ ! -s "$src_file" ]]; then
+                    echo "source 파일이 비어있습니다: $src_file"
+                    exit 1
+                fi
+            fi
             ;;
 
         *)
-            echo "지원하지 않는 SALT_FUNCTION 입니다: $SALT_FUNCTION"
+            echo "지원하지 않는 SALT_FUNCTION입니다: $SALT_FUNCTION"
             exit 1
             ;;
     esac
@@ -851,16 +929,20 @@ run_post() {
     # Salt 출력은 상황에 따라 여러 JSON 객체가 연속으로 쌓일 수 있음.
     # JSONDecoder.raw_decode()로 파일 안의 JSON 객체를 순차적으로 찾아서 파싱한다.
     #
-    # 결과 저장 정책:
-    #   result/<host> = stdout 만 저장
-    #   stdout 이 없으면 빈 파일 생성
-    #
-    #   error/<host> = stderr 만 저장
-    #   stderr 없이 실패한 경우 comment 저장
-    #   stderr/comment 모두 없으면 no_stderr 저장
-    #
-    #   성공 comment 는 저장하지 않는다.
-    # ============================================================
+	# 결과 저장 정책:
+	#   result/<host>
+	#     - 정상 결과의 stdout 저장 
+	#     - 정상 결과에 stdout이 없으면 빈 파일 생성
+	#
+	#   error/<host>
+	#     - stderr가 있으면 stderr 저장
+	#     - cmd.run 실패 시 stderr 없이 stdout만 있으면 stdout 저장
+	#     - cmd.run 실패 시 stderr/stdout이 모두 없으면 빈 error 파일 생성
+	#     - state 실패 시 stderr가 없으면 실패 comment 저장
+	#     - state 실패 시 stderr/comment가 모두 없으면 no_stderr 저장
+	#
+	#   성공 상태의 comment는 저장하지 않는다. 
+	# ============================================================
     python3 - "$log" "$server_file" "$result_dir" "$error_dir" <<'PY'
 import json
 import os
@@ -1201,58 +1283,47 @@ has_user_local() {
 # ============================================================
 # local 스크립트 실행
 # ============================================================
-# Salt 실행 전에 master 로컬에서 먼저 실행할 작업을 수행한다.
+# 최종 server 필터링 완료 후 Salt 실행 전에
+# master 로컬에서 local 스크립트를 실행한다.
 #
-# 사용 예:
-#   - rsync로 파일 사전 배포
-#   - control 스크립트 실행
-#   - 최종 server 파일 기준의 로컬 루프 작업
-#
-# 주의:
-#   - local 실패 시 전체 작업도 실패 처리한다.
-#   - 실행 기준 변수는 기존 프레임워크 변수 그대로 사용한다.
-#     base_dir, home_dir, apply_dir, log_dir, tmp_dir 등
+# local 파일이 없거나 주석/공백만 있으면 실행하지 않는다.
+# local 실행 실패 시 전체 작업도 실패 처리한다.
 # ============================================================
 run_user_local() {
     local local_file="$base_dir/local"
+
     if ! has_user_local; then
         return 0
     fi
 
     echo
-    echo "============================================================"
-    echo "local 실행"
-    echo "============================================================"
-    echo "파일: $local_file"
-    echo "------------------------------------------------------------"
+    echo "[ local 실행 ]"
 
     (
         cd "$base_dir"
         . "$local_file"
     )
-
-    #echo "------------------------------------------------------------"
 }
 
 # ============================================================
-# sage 실행 히스토리 기록 #20260601 추가
+# sage Salt 실행 히스토리 기록
 # ============================================================
-# sage로 Salt 작업을 실행할 때마다 전역 히스토리 로그를 남긴다.
+# salt_apply 실행 후 전역 히스토리 로그를 남긴다.
 #
 # 기록 위치:
 #   /var/log/salt/sage_history.log
 #
-# 기록 형식:
-#   날짜시간    JOB: 작업경로    JID: Salt_JID    SALT_RC: Salt_결과코드
+# 일반 실행:
+#   날짜시간    JOB: 작업경로    JID: Salt_JID    SALT_RC: 결과코드
 #
-# 예:
-#   2026-06-01 10:03:03    JOB: /data/salt/cron/backup/backup_mailbox_exec    JID: 20260601010303213293    SALT_RC: 0
+# JID_CHUNK_SIZE 실행:
+#   - 청크별 JID, 대상 수, 결과코드 기록
+#   - 마지막에 전체 청크 완료 요약 기록
 #
 # 주의:
-#   - 히스토리 기록 실패가 Salt 작업 실패로 이어지면 안 되므로
-#     마지막에 2>/dev/null || true 로 무시한다.
-#   - ASYNC=true 인 경우 $log_dir/async_jid 에 저장된 JID를 사용한다.
-#   - JID 파일이 없으면 no_jid 로 기록한다.
+#   - Bash 문법 검사 실패, 실행 전 검증 실패, 사용자 취소는 기록하지 않는다.
+#   - 히스토리 기록 실패가 Salt 작업 실패로 이어지지 않도록 오류를 무시한다.
+#   - async_jid 파일이 없으면 JID는 no_jid로 기록한다.
 # ============================================================
 write_sage_history() {
     local history_dir="/var/log/salt"
@@ -1322,6 +1393,14 @@ write_sage_history() {
 rm -f "$log_dir/server_fail" "$log_dir/log_salt"
 
 # ============================================================
+# Sage 실행 요약 기본값
+# ============================================================
+# set -u 환경에서 분기 누락으로 미정의 변수가 발생하지 않도록
+# 요약 출력 변수에 기본값을 설정한다.
+server_summary="기존 파일 사용"
+minion_summary="key 완료 / ping 완료"
+
+# ============================================================
 # 대상 서버 목록 생성
 #
 # 우선순위
@@ -1339,11 +1418,6 @@ if [[ -s "$base_dir/server" ]]; then
 else
     > "$server_backup"
 fi
-
-echo
-echo "============================================================"
-echo "대상 서버 목록 준비"
-echo "============================================================"
 
 if declare -F make_server >/dev/null; then
     make_server_effective="$tmp_dir/make_server_effective"
@@ -1366,54 +1440,38 @@ if declare -F make_server >/dev/null; then
     ' > "$make_server_effective"
 
     if [[ -s "$make_server_effective" ]]; then
-        echo "▶ config에 server 파일 생성 로직이 있습니다."
-        echo "------------------------------------------------------------"
-        declare -f make_server | awk '
-            /^[[:space:]]*#/ { next }
-            /^[[:space:]]*$/ { next }
-            { print }
-        '
-        echo "------------------------------------------------------------"
-        echo "▶ 위 로직으로 server 실행 대상을 생성합니다."
-        echo "▶ server 파일 생성중"
-
         # make_server 결과가 실제로 있는지 확인하기 위해 기존 server는 비우고 실행
         > "$base_dir/server"
 
         make_server
         if [[ ! -s "$base_dir/server" ]]; then
-            echo "⚠ make_server 실행 결과 server 파일이 없거나 비어있습니다."
-
             if [[ -s "$server_backup" ]]; then
                 cp -f "$server_backup" "$base_dir/server"
-                echo "▶ 기존 server 파일을 사용합니다."
+				server_summary="기존 파일 사용"
             else
-                echo "⏹       $base_dir/server 파일이 없거나 비어있습니다."
+				echo "make_server 실행 결과 server 파일이 없거나 비어있습니다."
+				echo "확인 경로: $base_dir/server"
                 exit 1
             fi
+        else
+            server_summary="config make_server 사용"
         fi
     else
-        echo "▶ config에 make_server 함수는 있지만 실제 server 생성 로직이 없습니다."
-
         if [[ ! -s "$base_dir/server" ]]; then
             echo "⏹       $base_dir/server 파일이 없거나 비어있습니다."
             exit 1
         fi
 
-        echo "▶ 기존 server 파일을 사용합니다."
     fi
 else
-    echo "▶ config에 make_server 함수가 없습니다."
-
     if [[ ! -s "$base_dir/server" ]]; then
         echo "⏹       $base_dir/server 파일이 없거나 비어있습니다."
         exit 1
     fi
 
-    echo "▶ 기존 server 파일을 사용합니다."
 fi
 
-# server_all 대신 server 파일을 기준으로 사용
+# server 파일에서 중복을 제거한 전체 대상 목록 생성
 awk 'NF {print $1}' "$base_dir/server" | sort -u > "$tmp_dir/server_target"
 
 if [[ ! -s "$tmp_dir/server_target" ]]; then
@@ -1424,11 +1482,7 @@ fi
 # ============================================================
 # Salt에 등록된 accepted minion 목록 생성
 # ============================================================
-echo
-echo "============================================================"
-echo "Salt minion 상태 검사"
-echo "============================================================"
-echo "▶ key 검사중"
+minion_summary="key 완료 / ping 완료"
 
 salt-key -l accepted 2>/dev/null \
     | sed '1d;s/^[[:space:]]*//' \
@@ -1470,8 +1524,7 @@ fi
 # ============================================================
 case "${SKIP_PING:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
-        echo "▶ ping 검사 생략"
-        #echo "▶ salt-key accepted 서버를 최종 실행 대상으로 사용합니다."
+		minion_summary="key 완료 / ping 생략"
 
         # ping 검사를 생략하므로 registered 서버 전체를 ping_ok로 간주
         cp -f "$tmp_dir/server_registered" "$tmp_dir/server_ping_ok"
@@ -1481,7 +1534,7 @@ case "${SKIP_PING:-false}" in
         ;;
 
     false|FALSE|False|0|no|NO|No|n|N|"")
-        echo "▶ ping 검사중"
+		minion_summary="key 완료 / ping 완료"
 
         if [[ -n "$server_registered_list" ]]; then
             salt -L "$server_registered_list" \
@@ -1558,8 +1611,6 @@ cat "$tmp_dir/server_fail_not_registered" \
     | sort -k1,1 \
     > "$log_dir/server_fail"
 
-echo "▶ Salt minion 상태 검사 완료"
-
 if [[ ! -s "$base_dir/server" ]]; then
     echo "최종 실행 가능한 서버가 없습니다."
     echo "제외 서버 목록: $log_dir/server_fail"
@@ -1567,11 +1618,47 @@ if [[ ! -s "$base_dir/server" ]]; then
 fi
 
 # ============================================================
-# 실행 대상/제외 대상 정보 출력
+# 실행 대상/제외 대상 및 실행 정보 요약
 # ============================================================
 server_list=$(paste -sd, "$base_dir/server")
 server_count=$(wc -l < "$base_dir/server")
 skip_count=$(wc -l < "$log_dir/server_fail")
+
+# ============================================================
+# JID_CHUNK_SIZE 자동 적용
+# ============================================================
+# config에 JID_CHUNK_SIZE를 직접 선언하지 않은 경우에만 적용한다.
+#
+# 적용 조건:
+#   - ASYNC=false
+#   - COLLECT_BY_JID=true
+#   - 최종 실행 대상이 200대 초과
+#
+# 위 조건을 모두 만족하면 JID_CHUNK_SIZE=200을 자동 적용한다.
+# ============================================================
+if [[ "$jid_chunk_size_declared" -eq 0 ]]; then
+    case "${ASYNC:-false}" in
+        true|TRUE|True|1|yes|YES|Yes|y|Y)
+            JID_CHUNK_SIZE=""
+            ;;
+
+        *)
+            case "${COLLECT_BY_JID:-true}" in
+                true|TRUE|True|1|yes|YES|Yes|y|Y)
+                    if (( server_count > 200 )); then
+                        JID_CHUNK_SIZE=200
+                    else
+                        JID_CHUNK_SIZE=""
+                    fi
+                    ;;
+
+                *)
+                    JID_CHUNK_SIZE=""
+                    ;;
+            esac
+            ;;
+    esac
+fi
 
 ASYNC_RESULT_MODE=0
 case "${ASYNC_RESULT:-false}" in
@@ -1581,154 +1668,129 @@ case "${ASYNC_RESULT:-false}" in
         ;;
 esac
 
-
 jid_chunk_count=0
 if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
     jid_chunk_count=$(( (server_count + JID_CHUNK_SIZE - 1) / JID_CHUNK_SIZE ))
 fi
 
-echo
-echo "============================================================"
-echo "최종 실행 대상 서버"
-echo "============================================================"
-paste -sd, "$base_dir/server"
-echo "------------------------------------------------------------"
-echo "서버 개수: $server_count"
-echo "------------------------------------------------------------"
-echo
-if (( skip_count > 0 )); then
-    echo
-    echo "============================================================"
-    echo "제외 서버 목록"
-    echo "============================================================"
-    awk '{print $1 "(" $2 ")"}' "$log_dir/server_fail" | paste -sd,
-    echo "------------------------------------------------------------"
-    echo "제외 서버 수: $skip_count"
-    echo "------------------------------------------------------------"
-    echo
-fi
-
 if (( server_count == 0 )); then
-    echo "⏹        실행 대상 없음"
+    echo "실행 대상 없음"
     exit 1
 fi
-# ============================================================
-# local 사용 모드 출력
-# ============================================================
-echo
-echo "============================================================"
-echo "local 사용 모드"
-echo "============================================================"
-echo "파일: $base_dir/local"
-echo "------------------------------------------------------------"
 
-if has_user_local; then
-    echo "▶ local=true"
-    echo "salt-run 실행 전에 master 로컬에서 local 스크립트를 실행합니다."
-else
-    echo "▶ local=false"
-    echo "local 파일이 없거나 주석/공백만 있어 실행하지 않습니다."
+# 실행 전 작업 파일과 필수 인자를 검증한다.
+# 정상일 때는 출력하지 않고, 검증 실패 시 오류만 출력한다.
+job_validation_output=""
+if ! job_validation_output="$(validate_job 2>&1)"; then
+    printf '%s\n' "$job_validation_output"
+    exit 1
 fi
 
-#echo "------------------------------------------------------------"
+local_status="OFF"
+if has_user_local; then
+	local_status="ON"
+fi
 
-# 실행 전 작업 내용 검증 및 출력
-validate_and_preview_job
+remote_status="OFF"
+if [[ "$SALT_FUNCTION" == "cmd.run" && "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
+    remote_status="ON"
+fi
 
-echo "============================================================"
-echo "실행 모드"
-echo "============================================================"
-case "${ASYNC:-false}" in
-    true|TRUE|True|1|yes|YES|Yes|y|Y)
-        echo "▶ ASYNC=true"
-        echo "Salt job만 등록하고 결과는 기다리지 않습니다."
-
-        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-            echo "▶ ASYNC_RESULT=true"
-            echo "remote stdout/stderr/exit code를 event로 수집합니다."
-            echo "result/error 생성과 post 실행은 listener가 처리합니다."
-        else
-            echo "▶ ASYNC_RESULT=false"
-            echo "result/error 생성과 post 스크립트는 실행하지 않습니다."
-        fi
-        ;;
-    *)
-        echo "▶ ASYNC=false"
-        echo "Salt 결과를 기다린 뒤 result/error를 생성하고 post를 실행합니다."
-
-        case "${COLLECT_BY_JID:-true}" in
-            true|TRUE|True|1|yes|YES|Yes|y|Y)
-                echo "▶ COLLECT_BY_JID=true"
-                echo "JID 기반으로 진행률을 확인하고 마지막에 결과를 수집합니다."
-
-                if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
-                    echo ""
-					echo "▶ JID_CHUNK_SIZE=$JID_CHUNK_SIZE"
-                    echo "전체 대상 수: $server_count"
-                    echo "총 실행 횟수: $jid_chunk_count"
-                    #echo "------------------------------------------------------------"
-
-                    chunk_no=1
-                    chunk_start=1
-                    while (( chunk_no <= jid_chunk_count )); do
-                        chunk_end=$(( chunk_start + JID_CHUNK_SIZE - 1 ))
-                        if (( chunk_end > server_count )); then
-                            chunk_end=$server_count
-                        fi
-
-                        chunk_targets=$(( chunk_end - chunk_start + 1 ))
-                        echo "${chunk_no}/${jid_chunk_count} : ${chunk_targets}대"
-
-                        chunk_start=$(( chunk_end + 1 ))
-                        chunk_no=$(( chunk_no + 1 ))
-                    done
-                fi
-                ;;
-            *)
-                echo "▶ COLLECT_BY_JID=false"
-                echo "기존 방식처럼 Salt stdout을 log_salt에 기록하며 진행률을 계산합니다."
-                ;;
-        esac
-        ;;
-esac
-#echo "------------------------------------------------------------"
-echo
-
-echo "============================================================"
-echo "post 사용 모드"
-echo "============================================================"
-case "${ASYNC:-false}" in
-    true|TRUE|True|1|yes|YES|Yes|y|Y)
-        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]] && post_has_effective_content "$base_dir/post"; then
-            echo "파일: $base_dir/post"
-            echo "------------------------------------------------------------"
-            echo "▶ post=true"
-            echo "ASYNC_RESULT 완료 event로 result/error가 모두 생성되면 post 스크립트를 1회 실행합니다."
-        else
-            echo "▶ post=false"
-
-            if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-                echo "post 파일이 없거나 주석/공백만 있어 실행하지 않습니다."
-            else
-                echo "ASYNC=true, ASYNC_RESULT=false 이므로 result/error 생성과 post 스크립트 실행을 생략합니다."
+post_status="OFF"
+if post_has_effective_content "$base_dir/post"; then
+    case "${ASYNC:-false}" in
+        true|TRUE|True|1|yes|YES|Yes|y|Y)
+            if [[ "$ASYNC_RESULT_MODE" -eq 1 ]]; then
+                post_status="ON"
             fi
+            ;;
+        *)
+            post_status="ON"
+            ;;
+    esac
+fi
+
+# ============================================================
+# Sage 실행 정보 요약
+# ============================================================
+echo
+echo "=========================================================================="
+echo
+echo "[ sage 실행 정보 ]"
+echo "server : ${server_summary:-기존 파일 사용}"
+echo "minion : ${minion_summary:-key 완료 / ping 완료}"
+echo
+
+printf 'local  : %-3s  %s\n' "$local_status" "$base_dir/local"
+printf 'remote : %-3s  %s\n' "$remote_status" "$base_dir/remote"
+printf 'post   : %-3s  %s\n' "$post_status" "$base_dir/post"
+echo
+echo "=========================================================================="
+echo
+echo "[ 실행 모드 ]"
+
+if (( ${#config_declared_options[@]} > 0 )); then
+    for option_name in "${config_declared_options[@]}"; do
+
+        # JID_CHUNK_SIZE가 실제 사용 중이면
+        # 아래 전용 영역에서 상세 내용을 함께 출력하므로 여기서는 제외
+        if [[ "$option_name" == "JID_CHUNK_SIZE" && -n "${JID_CHUNK_SIZE:-}" ]]; then
+            continue
+        fi
+
+        printf '%s=%s\n' \
+            "$option_name" \
+            "${config_declared_values[$option_name]-}"
+    done
+else
+    echo "별도 설정 없음 / 기본값 사용"
+fi
+
+# ============================================================
+# JID_CHUNK_SIZE 실행 정보
+# ============================================================
+# config 직접 설정 또는 대상 수 기준 자동 적용 여부와 관계없이
+# 실제 JID_CHUNK_SIZE가 사용되는 경우에만 출력한다.
+# ============================================================
+if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
+    echo
+    echo "JID_CHUNK_SIZE=$JID_CHUNK_SIZE"
+    echo "ㄴ 전체 대상 : ${server_count}대"
+    echo "ㄴ 분할 단위 : ${JID_CHUNK_SIZE}대"
+    echo "ㄴ 실행 횟수 : 총 ${jid_chunk_count}회"
+fi
+
+echo
+
+case "${ASYNC:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+            echo "Salt job 등록 후 event 결과 수집"
+        else
+            echo "Salt job 등록 후 종료"
         fi
         ;;
+
     *)
-        if post_has_effective_content "$base_dir/post"; then
-			echo "파일: $base_dir/post"
-			echo "------------------------------------------------------------"
-            echo "▶ post=true"
-            echo "salt-run 완료 후 사용자 post 스크립트를 실행합니다."
-        else
-            echo "▶ post=false"
-            echo "post 파일이 없거나 주석/공백만 있어 실행하지 않습니다."
+        if [[ -z "${JID_CHUNK_SIZE:-}" ]]; then
+            echo "Salt 결과 수집 후 종료"
         fi
         ;;
 esac
-echo "------------------------------------------------------------"
-echo
 
+echo "=========================================================================="
+if (( skip_count > 0 )); then
+    echo
+    echo "[ 제외 서버 : ${skip_count}대 ]"
+    awk '{print $1 "(" $2 ")"}' "$log_dir/server_fail" | paste -sd,
+fi
+
+echo
+echo "[ 실행 대상 : ${server_count}대 ]"
+paste -sd, "$base_dir/server"
+echo
+echo "=========================================================================="
+echo
 # ============================================================
 # 사용자 실행 확인
 # -y 옵션이 있으면 자동 yes 처리
@@ -1736,7 +1798,7 @@ echo
 if [[ $AUTO_YES -eq 1 ]]; then
     answer="y"
 else
-    read -r -p "▶ 이 서버들에 대해 실행하시겠습니까? (Y/n): " answer
+	read -r -p "이 서버들에 대해 실행하시겠습니까? (Y/n): " answer
 fi
 
 case "$answer" in
@@ -1789,7 +1851,6 @@ case "$answer" in
                     echo "------------------------------------------------------------"
                     echo "결과 조회 명령어:"
                     echo "salt-run jobs.lookup_jid $async_jid_value --out=json"
-                    #echo "------------------------------------------------------------"
                 fi
 
                 exit 0
