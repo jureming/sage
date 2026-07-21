@@ -26,7 +26,7 @@
 - `salt_framework/start.sh`: 작업 디렉토리 결정, `config` 로드, 대상 서버 준비, 실행 전 검증을 담당합니다.
 - `salt_framework/salt_apply`: 실제 Salt 실행, JID 수집, 결과 분류를 담당합니다.
 - `salt_framework_event_notify.sh`: `ASYNC_RESULT=true`일 때 minion에서 실행 결과 event를 전송합니다.
-- `salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 필요하면 `post`를 실행합니다.
+- `salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 marker 기준으로 완료되면 `post`를 실행합니다.
 
 ## 실행 방법
 
@@ -68,7 +68,7 @@ CLI 옵션:
 | `config` | 예 | Salt 실행 설정을 Bash 변수로 정의합니다. |
 | `server` | 조건부 | 실행 대상 서버 목록입니다. `make_server`가 `server`를 생성하면 없어도 됩니다. |
 | `remote` | 조건부 | `cmd.run + RUN_SCRIPT` 모드에서 대상 서버에서 실행할 스크립트입니다. |
-| `local` | 아니오 | Salt 실행 전에 master 로컬에서 실행할 스크립트입니다. 주석/공백만 있으면 무시합니다. |
+| `local` | 아니오 | Salt 실행 전에 master 로컬에서 실행할 스크립트입니다. 주석/공백만 있으면 무시합니다. `file_deploy` 함수를 사용할 수 있습니다. |
 | `post` | 아니오 | 결과 생성 후 master 로컬에서 실행할 후처리 스크립트입니다. 주석/공백만 있으면 무시합니다. |
 
 `server` 파일은 한 줄에 host 하나를 권장합니다. 빈 줄과 `#` 주석은 일부 처리에서 무시됩니다.
@@ -116,6 +116,36 @@ make_server() {
 }
 ```
 
+## local file_deploy
+
+`local` 파일 안에서는 `file_deploy`로 파일을 전체 대상 서버에 배포할 수 있습니다. 내부적으로 Salt `state.single file.managed`를 사용하며, 배포 실패는 `error/<host>`에 `deploy fail : <파일명>` 형식으로 기록합니다.
+
+```bash
+file_deploy "$base_dir/files/app.tar.gz" "/home/"
+file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
+```
+
+동작 기준:
+
+- `local` 실행 중에만 사용할 수 있습니다.
+- 대상 경로는 절대경로여야 합니다.
+- 대상 경로가 `/`로 끝나면 원본 파일명을 유지합니다.
+- 배포용 source는 `/data/salt/apply/sage_file_deploy/<run_id>/` 아래에 임시 staging 후 종료 시 삭제합니다.
+- 같은 파일시스템이면 hard link를 사용하고, 불가능하면 `cp -p`로 복사합니다.
+- 배포 실패가 있어도 `server` 목록은 유지하고 이후 remote/Salt 실행은 계속 진행합니다.
+
+파일 크기별 배포 chunk:
+
+| 파일 크기 | chunk |
+| --- | ---: |
+| 1MB 이하 | 200 |
+| 10MB 이하 | 100 |
+| 100MB 이하 | 30 |
+| 500MB 이하 | 10 |
+| 1GB 이하 | 5 |
+| 5GB 이하 | 2 |
+| 5GB 초과 | 1 |
+
 ## config 옵션
 
 필수 옵션:
@@ -160,6 +190,7 @@ timeout/재시도 옵션:
 | `PING_RETRY_COUNT` | `2` | host 단위 ping 재시도 횟수입니다. |
 | `PING_RETRY_SLEEP` | `2` | ping 재시도 사이 대기 초입니다. |
 | `JSON_PARSE_HARD_TIMEOUT` | `5` | JID missing JSON 파싱 hard timeout입니다. |
+| `FILE_DEPLOY_WAIT_TIMEOUT` | `7200` | `file_deploy`에서 파일 배포 JID 결과를 기다리는 최대 시간입니다. |
 
 디버그/내부 경로 옵션:
 
@@ -191,6 +222,7 @@ ASYNC_RESULT/event 옵션:
 | --- | --- |
 | `log/log_salt` | Salt 실행 또는 최종 `jobs.lookup_jid` 결과 JSON 로그입니다. |
 | `log/async_jid` | async/JID 실행에서 발급된 JID입니다. |
+| `log/async_done_hosts/<host>` | `ASYNC_RESULT`에서 listener가 실제 event를 받은 host marker입니다. |
 | `log/server_fail` | salt-key 미등록, ping 실패, dirty_nodes 제외 목록입니다. |
 | `log/debug.log` | debug 모드 로그입니다. |
 | `result/<host>` | host별 정상 stdout 결과입니다. stdout이 없어도 성공이면 빈 파일이 생성될 수 있습니다. |
@@ -198,13 +230,13 @@ ASYNC_RESULT/event 옵션:
 
 ## async result listener
 
-`ASYNC_RESULT=true`를 쓰려면 master에서 listener가 실행 중이어야 합니다.
+`ASYNC_RESULT=true`를 쓰려면 master에서 listener service가 실행 중이어야 합니다.
 
 ```bash
-python3 /data/salt/common/salt_framework_event_listener.py
+systemctl status salt-framework-event.service
 ```
 
-listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다. 모든 대상 host의 `result/` 또는 `error/` 파일이 생성되면 `post`가 유효할 때 한 번만 실행합니다.
+listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다. 모든 대상 host의 `log/async_done_hosts/<host>` marker가 생성되면 `post`가 유효할 때 한 번만 실행합니다.
 
 ## 의존 명령
 
@@ -221,3 +253,4 @@ listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_
 - `base_dir`, `home_dir`, `apply_dir`은 `start.sh`가 다시 고정합니다. config에서 같은 이름을 선언해도 실행 기준은 `start.sh`가 결정한 값입니다.
 - `ASYNC=true` 단독 모드는 job만 등록하고 `result/`, `error/`, `post` 처리를 하지 않습니다.
 - 실패 분류는 stderr를 우선합니다. stderr가 있으면 stdout은 `result/`, stderr는 `error/`에 저장됩니다.
+- `file_deploy`가 먼저 만든 `error/<host>`는 이후 remote 결과 처리에서 삭제하지 않고 append 방식으로 유지합니다.
