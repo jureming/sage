@@ -130,21 +130,21 @@ init_job_dir() {
     # 권한/타임스탬프까지 그대로 복사
     cp -a "$sample_dir" "$dest_dir"
 
-    echo "============================================================"
+    echo "=========================================================================="
     echo "신규 작업 디렉토리 생성 완료"
-    echo "============================================================"
+    echo "=========================================================================="
     echo "  원본 : $sample_dir"
     echo "  생성 : $dest_dir"
-    echo "------------------------------------------------------------"
+    echo "--------------------------------------------------------------------------"
     echo "다음 파일을 작업에 맞게 수정하세요:"
     echo "  README : 작업 기본 정보(작업명/설명/작성자 등)"
     echo "  config : 서버 목록 생성(make_server) 및 실행 옵션"
     echo "  remote : 대상 서버에서 실행할 명령"
     echo "  local  : (선택) Salt 실행 전 master 로컬 사전 작업"
     echo "  post   : (선택) 실행 결과 정리 후 후처리"
-    echo "------------------------------------------------------------"
+    echo "--------------------------------------------------------------------------"
     echo "실행 예: cd $dest_dir && sage"
-    echo "============================================================"
+    echo "=========================================================================="
 }
 
 # ============================================================
@@ -489,6 +489,29 @@ mkdir -p "$error_dir"
 mkdir -p "$tmp_dir"
 
 # ============================================================
+# 공통 화면 출력 형식
+# ============================================================
+SAGE_OUTPUT_LINE="=========================================================================="
+
+sage_print_line() {
+    printf '%s\n' "$SAGE_OUTPUT_LINE"
+}
+
+sage_print_section() {
+    local title="$1"
+
+    echo
+    sage_print_line
+    printf '[ %s ]\n\n' "$title"
+}
+
+sage_print_subsection() {
+    local title="$1"
+
+    printf '  [ %s ]\n\n' "$title"
+}
+
+# ============================================================
 # CLI debug 옵션
 # ============================================================
 # config에는 디버그 옵션을 노출하지 않고, start.sh 실행 옵션으로만 켠다.
@@ -710,8 +733,15 @@ if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
 fi
 
 # ============================================================
-# 종료 시 임시 디렉토리 정리
+# file_deploy 내부 staging 경로
 # ============================================================
+# local의 file_deploy가 임의 경로의 파일을 Salt fileserver로 전달할 수 있도록
+# apply_dir 아래에 실행 단위 staging 경로를 사용한다.
+# 같은 파일시스템이면 hard link를 사용하고, 불가능할 때만 cp -p로 복사한다.
+# ============================================================
+sage_file_deploy_run_id="$(date '+%Y%m%d%H%M%S')_$$"
+file_deploy_stage_root="$apply_dir/sage_file_deploy/$sage_file_deploy_run_id"
+
 cleanup() {
     if [[ "$KEEP_TMP" -eq 1 ]]; then
         echo "[DEBUG] tmp 유지: $tmp_dir"
@@ -719,6 +749,11 @@ cleanup() {
         rm -rf "$tmp_dir"
     fi
 
+    # Salt fileserver에 임시로 노출한 file_deploy source 정리
+    if [[ -n "${file_deploy_stage_root:-}" ]]; then
+        rm -rf "$file_deploy_stage_root"
+        rmdir "$apply_dir/sage_file_deploy" 2>/dev/null || true
+    fi
 
     if [[ "${LOCK_ACQUIRED:-0}" -eq 1 && -n "${lock_file:-}" ]]; then
         rm -f "$lock_file"
@@ -919,9 +954,10 @@ run_post() {
     error_dir="$base_dir/error"
     result_status="${RESULT_STATUS_FILE:-${tmp_dir:-$base_dir/.tmp}/result_status}"
 
-    # 이전 결과 초기화
-    rm -rf "$result_dir" "$error_dir"
-    mkdir -p "$result_dir" "$error_dir"
+	# start.sh 시작 단계에서 이미 이전 실행 결과를 초기화한다.
+	# local의 file_deploy가 먼저 만든 error/<host>를 유지해야 하므로
+	# 여기서는 result/error를 다시 삭제하지 않고 디렉토리만 보장한다.
+	mkdir -p "$result_dir" "$error_dir"
 
     # ============================================================
     # log_salt JSON 파싱
@@ -931,7 +967,7 @@ run_post() {
     #
 	# 결과 저장 정책:
 	#   result/<host>
-	#     - 정상 결과의 stdout 저장 
+	#     - 정상 결과의 stdout 저장
 	#     - 정상 결과에 stdout이 없으면 빈 파일 생성
 	#
 	#   error/<host>
@@ -941,7 +977,7 @@ run_post() {
 	#     - state 실패 시 stderr가 없으면 실패 comment 저장
 	#     - state 실패 시 stderr/comment가 모두 없으면 no_stderr 저장
 	#
-	#   성공 상태의 comment는 저장하지 않는다. 
+	#   성공 상태의 comment는 저장하지 않는다.
 	# ============================================================
     python3 - "$log" "$server_file" "$result_dir" "$error_dir" <<'PY'
 import json
@@ -974,7 +1010,6 @@ target_set = set(target_hosts)
 returned_hosts = set()
 parsed_count = 0
 
-
 def write_file(directory, host, content):
     path = os.path.join(directory, host)
 
@@ -983,12 +1018,19 @@ def write_file(directory, host, content):
 
     content = str(content).rstrip()
 
-    with open(path, "w", encoding="utf-8") as out:
+    # file_deploy가 local 단계에서 먼저 만든 error/<host>가 있으면
+    # remote 오류를 덮어쓰지 않고 빈 줄 뒤에 추가한다.
+    append_mode = directory == error_dir and os.path.exists(path)
+    mode = "a" if append_mode else "w"
+
+    with open(path, mode, encoding="utf-8") as out:
+        if append_mode and os.path.getsize(path) > 0 and content:
+            out.write("\n")
+
         if content:
             out.write(content + "\n")
-        else:
+        elif not append_mode:
             out.write("")
-
 
 def stringify_value(value):
     if value is None:
@@ -1171,6 +1213,21 @@ with open(returned_path, "w", encoding="utf-8") as out:
 # result_status/no_return 처리는 bash 쪽에서 이어서 수행한다.
 PY
 
+	append_error_content() {
+	local host="$1"
+	local content="$2"
+	local error_file="$error_dir/$host"
+
+	if [[ -s "$error_file" && -n "$content" ]]; then
+	echo >> "$error_file"
+	fi
+
+	if [[ -n "$content" ]]; then
+	printf '%s\n' "$content" >> "$error_file"
+	elif [[ ! -e "$error_file" ]]; then
+	: > "$error_file"
+	fi
+	}
     returned_hosts_file="${tmp_dir:-$base_dir/.tmp}/post_returned_hosts"
 
     # ============================================================
@@ -1190,13 +1247,15 @@ PY
                 continue
             fi
 
-            # 최종 파싱에서 이미 result 또는 error가 만들어졌으면 중복 기록하지 않는다.
-            if [[ -f "$result_dir/$host" || -f "$error_dir/$host" ]]; then
-                continue
-            fi
+			# 최종 파싱에서 result가 만들어졌으면 중복 기록하지 않는다.
+			# error/<host>는 file_deploy가 먼저 만들었을 수 있으므로
+			# 존재 여부만으로 건너뛰지 않고 remote 상태를 뒤에 추가한다.
+			if [[ -f "$result_dir/$host" ]]; then
+				continue
+			fi
 
-            printf '%s\n' "$status" > "$error_dir/$host"
-        done < "$result_status"
+			append_error_content "$host" "$status"
+		done < "$result_status"
     fi
 
     # ============================================================
@@ -1211,15 +1270,24 @@ PY
 
         host="${host%%[[:space:]]*}"
 
-        if [[ ! -f "$result_dir/$host" && ! -f "$error_dir/$host" ]]; then
-            echo "no_return" > "$error_dir/$host"
-        fi
-    done < "$server_file"
+		# 최종 Salt return이 있으면 result/error 파싱 결과가 우선이다.
+		if [[ -s "$returned_hosts_file" ]] && grep -Fxq "$host" "$returned_hosts_file"; then
+		    continue
+		fi
 
-    result_count="$(find "$result_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-    error_count="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-    echo "정상 결과 파일 생성 완료: $result_dir (${result_count}개)"
-    echo "에러 파일 생성 완료: $error_dir (${error_count}개)"
+		# result_status에 이미 분류된 host면 해당 상태를 사용한다.
+		if [[ -s "$result_status" ]] && awk -F '\t' -v target="$host" '$1 == target {found=1} END {exit !found}' "$result_status"; then
+		    continue
+		fi
+
+		# file_deploy error가 이미 있어도 remote no_return은 뒤에 추가한다.
+		if [[ ! -f "$result_dir/$host" ]]; then
+		    append_error_content "$host" "no_return"
+		fi
+	done < "$server_file"
+
+	RESULT_FILE_COUNT="$(find "$result_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+	ERROR_FILE_COUNT="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
 }
 # ============================================================
 # 사용자 post 스크립트 사용 여부 확인
@@ -1241,6 +1309,7 @@ post_has_effective_content() {
 # run_post()가 result/ error/ 생성을 완료한 뒤 마지막으로 실행한다.
 # post 파일은 사용자 정의 후처리 전용이며, 형식은 자유다.
 # ============================================================
+
 run_user_post() {
     local post_file="$base_dir/post"
     local user_post_rc=0
@@ -1249,8 +1318,7 @@ run_user_post() {
         return 0
     fi
 
-    echo
-    echo "post 스크립트 실행중..."
+    sage_print_section "post 실행"
 
     set +e
     (
@@ -1260,9 +1328,9 @@ run_user_post() {
     set -e
 
     if [[ "$user_post_rc" -ne 0 ]]; then
-        echo "post 스크립트 실패"
+        printf '  post 스크립트 실행 실패 (rc=%s)\n' "$user_post_rc"
     else
-        echo "post 스크립트 실행 완료"
+        echo "  post 스크립트 실행 완료"
     fi
 }
 
@@ -1281,6 +1349,393 @@ has_user_local() {
 }
 
 # ============================================================
+# file_deploy 내부 함수
+# ============================================================
+# local 안에서 아래 형식으로 사용한다.
+#
+#   file_deploy "$base_dir/files/app.tar.gz" "/home/"
+#
+# 동작:
+#   - 호출 위치에서 즉시 동기 실행한다.
+#   - 목적지가 / 로 끝나면 원본 파일명을 유지한다.
+#   - source를 Salt fileserver staging 경로에 hard link 또는 cp -p로 준비한다.
+#   - 파일 크기에 따라 JID 청크 크기를 자동 결정한다.
+#   - state.single file.managed로 전체 server에 배포한다.
+#   - 동일한 파일은 file.managed가 변경 없이 성공 처리한다.
+#   - 실패 host는 $base_dir/error/<host>에 deploy fail 내용을 append한다.
+#   - 배포 실패 여부와 관계없이 기존 server 목록은 변경하지 않는다.
+# ============================================================
+file_deploy_call_no=0
+
+__sage_file_deploy_chunk_size() {
+    local file_size="$1"
+
+    if (( file_size <= 1 * 1024 * 1024 )); then
+        echo 200
+    elif (( file_size <= 10 * 1024 * 1024 )); then
+        echo 100
+    elif (( file_size <= 100 * 1024 * 1024 )); then
+        echo 30
+    elif (( file_size <= 500 * 1024 * 1024 )); then
+        echo 10
+    elif (( file_size <= 1024 * 1024 * 1024 )); then
+        echo 5
+    elif (( file_size <= 5 * 1024 * 1024 * 1024 )); then
+        echo 2
+    else
+        echo 1
+    fi
+}
+
+__sage_file_deploy_append_error() {
+    local host="$1"
+    local source_name="$2"
+    local error_file="$error_dir/$host"
+
+    mkdir -p "$error_dir"
+
+    if [[ -s "$error_file" ]]; then
+        echo >> "$error_file"
+    fi
+
+    printf 'deploy fail : %s\n' "$source_name" >> "$error_file"
+}
+
+__sage_file_deploy_parse_result() {
+    local log_file="$1"
+    local server_file="$2"
+    local success_file="$3"
+    local fail_file="$4"
+
+    python3 - "$log_file" "$server_file" "$success_file" "$fail_file" <<'PY_FILE_DEPLOY_RESULT'
+import json
+import sys
+
+log_file, server_file, success_file, fail_file = sys.argv[1:]
+
+with open(server_file, "r", encoding="utf-8", errors="replace") as f:
+    targets = [
+        line.strip().split()[0]
+        for line in f
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+target_set = set(targets)
+success = set()
+
+try:
+    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+except FileNotFoundError:
+    raw = ""
+
+
+def state_result_is_success(value):
+    if not isinstance(value, dict):
+        return False
+
+    state_items = [item for item in value.values() if isinstance(item, dict) and "result" in item]
+
+    if not state_items:
+        return False
+
+    return all(item.get("result") is True for item in state_items)
+
+
+decoder = json.JSONDecoder()
+idx = 0
+
+while idx < len(raw):
+    start = raw.find("{", idx)
+    if start == -1:
+        break
+
+    try:
+        obj, used = decoder.raw_decode(raw[start:])
+    except json.JSONDecodeError:
+        idx = start + 1
+        continue
+
+    if isinstance(obj, dict):
+        for host, value in obj.items():
+            if host in target_set and state_result_is_success(value):
+                success.add(host)
+
+    idx = start + used
+
+with open(success_file, "w", encoding="utf-8") as f:
+    for host in targets:
+        if host in success:
+            f.write(host + "\n")
+
+with open(fail_file, "w", encoding="utf-8") as f:
+    for host in targets:
+        if host not in success:
+            f.write(host + "\n")
+PY_FILE_DEPLOY_RESULT
+}
+
+file_deploy() {
+    local source_input="${1:-}"
+    local destination_input="${2:-}"
+    local source_file=""
+    local source_name=""
+    local destination_file=""
+    local file_size=0
+    local deploy_chunk_size=0
+    local deploy_target_count=0
+    local deploy_chunk_count=0
+    local deploy_call_label=""
+    local deploy_work_dir=""
+    local deploy_stage_dir=""
+    local deploy_stage_file=""
+    local deploy_salt_source=""
+    local deploy_server_list=""
+    local deploy_salt_run_bin=""
+    local deploy_wait_timeout="${FILE_DEPLOY_WAIT_TIMEOUT:-7200}"
+    local deploy_salt_rc=0
+    local fileserver_cache_rc=0
+    local success_file=""
+    local fail_file=""
+    local success_count=0
+    local fail_count=0
+    local fail_list=""
+    local host=""
+
+    if [[ "${SAGE_LOCAL_ACTIVE:-0}" != "1" ]]; then
+        echo "file_deploy는 local 파일 안에서만 사용할 수 있습니다."
+        return 1
+    fi
+
+    if [[ $# -ne 2 || -z "$source_input" || -z "$destination_input" ]]; then
+        echo "file_deploy 사용법:"
+        echo '  file_deploy "<원본 파일>" "<대상 경로>"'
+        return 1
+    fi
+
+    if [[ ! -f "$source_input" ]]; then
+        echo "file_deploy 원본 파일 없음: $source_input"
+        return 1
+    fi
+
+    source_file="$(readlink -f -- "$source_input" 2>/dev/null || true)"
+
+    if [[ -z "$source_file" || ! -f "$source_file" ]]; then
+        echo "file_deploy 원본 파일 확인 실패: $source_input"
+        return 1
+    fi
+
+    if [[ "$destination_input" != /* ]]; then
+        echo "file_deploy 대상 경로는 절대경로여야 합니다: $destination_input"
+        return 1
+    fi
+
+    source_name="$(basename -- "$source_file")"
+
+    if [[ "$destination_input" == */ ]]; then
+        destination_file="${destination_input}${source_name}"
+    else
+        destination_file="$destination_input"
+    fi
+
+    if [[ "$destination_file" == "/" ]]; then
+        echo "file_deploy 대상 파일 경로가 올바르지 않습니다: $destination_file"
+        return 1
+    fi
+
+    file_size="$(stat -c '%s' -- "$source_file" 2>/dev/null || true)"
+
+    if [[ ! "$file_size" =~ ^[0-9]+$ ]]; then
+        echo "file_deploy 파일 크기 확인 실패: $source_file"
+        return 1
+    fi
+
+    deploy_target_count="$(awk 'NF && $1 !~ /^#/ {count++} END {print count+0}' "$base_dir/server")"
+
+    if [[ ! "$deploy_target_count" =~ ^[0-9]+$ || "$deploy_target_count" -lt 1 ]]; then
+        echo "file_deploy 실행 대상이 없습니다: $base_dir/server"
+        return 1
+    fi
+
+    deploy_chunk_size="$(__sage_file_deploy_chunk_size "$file_size")"
+
+    if (( deploy_chunk_size > deploy_target_count )); then
+        deploy_chunk_size="$deploy_target_count"
+    fi
+
+    deploy_chunk_count=$(( (deploy_target_count + deploy_chunk_size - 1) / deploy_chunk_size ))
+
+    file_deploy_call_no=$((file_deploy_call_no + 1))
+    printf -v deploy_call_label '%04d' "$file_deploy_call_no"
+
+    deploy_work_dir="$tmp_dir/file_deploy/$deploy_call_label"
+    deploy_stage_dir="$file_deploy_stage_root/$deploy_call_label"
+    deploy_stage_file="$deploy_stage_dir/source"
+    deploy_salt_source="salt://sage_file_deploy/$sage_file_deploy_run_id/$deploy_call_label/source"
+    success_file="$deploy_work_dir/success_hosts"
+    fail_file="$deploy_work_dir/fail_hosts"
+
+    rm -rf "$deploy_work_dir" "$deploy_stage_dir"
+    mkdir -p \
+        "$deploy_work_dir/log" \
+        "$deploy_work_dir/result" \
+        "$deploy_work_dir/error" \
+        "$deploy_work_dir/.tmp" \
+        "$deploy_stage_dir"
+
+    awk 'NF && $1 !~ /^#/ {print $1}' "$base_dir/server" | sort -u > "$deploy_work_dir/server"
+
+    # 같은 파일시스템이면 데이터 복사 없이 hard link를 사용한다.
+    # hard link가 불가능한 경우에만 권한/시간을 유지해 복사한다.
+    if ! ln -- "$source_file" "$deploy_stage_file" 2>/dev/null; then
+        if ! cp -p -- "$source_file" "$deploy_stage_file"; then
+            echo "file_deploy source staging 실패: $source_file"
+            return 1
+        fi
+    fi
+
+    deploy_server_list="$(paste -sd, "$deploy_work_dir/server")"
+
+    # Salt fileserver는 file list를 캐시하므로 실행 중 새로 만든 staging source가
+    # 즉시 보이도록 roots backend의 base 환경 file list cache를 비운다.
+    deploy_salt_run_bin="${SALT_RUN_BIN:-/usr/bin/salt-run}"
+
+    if [[ ! -x "$deploy_salt_run_bin" ]]; then
+        deploy_salt_run_bin="$(command -v salt-run 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$deploy_salt_run_bin" || ! -x "$deploy_salt_run_bin" ]]; then
+        echo "file_deploy salt-run 명령을 찾을 수 없습니다."
+        return 1
+    fi
+
+    set +e
+    "$deploy_salt_run_bin" \
+        fileserver.clear_file_list_cache \
+        saltenv=base \
+        backend=roots \
+        >/dev/null 2>&1
+    fileserver_cache_rc=$?
+    set -e
+
+    if [[ "$fileserver_cache_rc" -ne 0 ]]; then
+        echo "file_deploy fileserver cache 초기화 실패: rc=$fileserver_cache_rc"
+        return 1
+    fi
+
+	# file_deploy 기본 대기 시간은 7200초이며,
+	# 필요할 경우 FILE_DEPLOY_WAIT_TIMEOUT으로 별도 조정한다.
+	if [[ ! "$deploy_wait_timeout" =~ ^[0-9]+$ ]]; then
+		echo "FILE_DEPLOY_WAIT_TIMEOUT은 0 이상의 정수여야 합니다: $deploy_wait_timeout"
+		return 1
+	fi
+
+	sage_print_subsection "file_deploy"
+	printf '    원본 파일 : %s\n' "$source_file"
+	printf '    대상 경로 : %s\n' "$destination_file"
+	echo
+	echo "    배포 정보"
+	printf '      전체 대상 : %s대\n' "$deploy_target_count"
+	printf '      분할 단위 : %s대\n' "$deploy_chunk_size"
+	printf '      실행 횟수 : 총 %s회\n' "$deploy_chunk_count"
+	echo
+
+    set +e
+    (
+        export home_dir="$home_dir"
+        export framework_dir="$framework_dir"
+        export apply_dir="$apply_dir"
+        export base_dir="$deploy_work_dir"
+        export log_dir="$deploy_work_dir/log"
+        export result_dir="$deploy_work_dir/result"
+        export error_dir="$deploy_work_dir/error"
+        export tmp_dir="$deploy_work_dir/.tmp"
+        export RESULT_STATUS_FILE="$deploy_work_dir/.tmp/result_status"
+        export server_list="$deploy_server_list"
+        export server_count="$deploy_target_count"
+
+        export TIMEOUT="${TIMEOUT:-3}"
+        export ASYNC=false
+        export COLLECT_BY_JID=true
+        export JID_CHUNK_SIZE="$deploy_chunk_size"
+        export POLL_INTERVAL="${POLL_INTERVAL:-3}"
+        export JOB_WAIT_TIMEOUT="$deploy_wait_timeout"
+        export RUNNING_CHECK_INTERVAL="${RUNNING_CHECK_INTERVAL:-30}"
+        export LATE_CHECK_TIMEOUT="${LATE_CHECK_TIMEOUT:-5}"
+        export LATE_CHECK_HARD_TIMEOUT="${LATE_CHECK_HARD_TIMEOUT:-15}"
+        export LOOKUP_HARD_TIMEOUT="${LOOKUP_HARD_TIMEOUT:-30}"
+        export FINAL_LOOKUP_HARD_TIMEOUT="${FINAL_LOOKUP_HARD_TIMEOUT:-300}"
+        export PING_CHECK_PARALLEL="${PING_CHECK_PARALLEL:-10}"
+        export PING_RETRY_COUNT="${PING_RETRY_COUNT:-2}"
+        export PING_RETRY_SLEEP="${PING_RETRY_SLEEP:-2}"
+        export DEBUG_MODE="${DEBUG_MODE:-false}"
+        export DEBUG_PRINT="${DEBUG_PRINT:-false}"
+        export DEBUG_LOG="$deploy_work_dir/log/debug.log"
+        export SALT_APPLY_CONTEXT=file_deploy
+
+        SALT_FUNCTION="state.single"
+        SALT_ARGS=(
+            "file.managed"
+            "name=$destination_file"
+            "source=$deploy_salt_source"
+            "mode=keep"
+            "makedirs=True"
+            "show_changes=False"
+        )
+        export SALT_FUNCTION
+
+        . "$framework_dir/salt_apply"
+        exit "${SALT_RC:-1}"
+    )
+    deploy_salt_rc=$?
+    set -e
+
+    # Salt 명령 자체가 실패해도 반환된 성공 host는 살리고,
+    # 결과가 없거나 state result=False인 host만 배포 실패로 분류한다.
+    __sage_file_deploy_parse_result \
+        "$deploy_work_dir/log/log_salt" \
+        "$deploy_work_dir/server" \
+        "$success_file" \
+        "$fail_file"
+
+    success_count="$(wc -l < "$success_file")"
+    fail_count="$(wc -l < "$fail_file")"
+
+    if [[ -s "$fail_file" ]]; then
+        while IFS= read -r host; do
+            [[ -z "$host" ]] && continue
+            __sage_file_deploy_append_error "$host" "$source_name"
+        done < "$fail_file"
+
+        fail_list="$(paste -sd, "$fail_file")"
+    fi
+
+    rm -rf "$deploy_stage_dir"
+
+	echo
+	sage_print_subsection "file_deploy 결과"
+	printf '    대상 파일 : %s\n' "$source_name"
+	printf '    성공/실패 : %s / %s\n' "$success_count" "$fail_count"
+
+	if (( fail_count > 0 )); then
+	echo
+	echo "    실패 서버"
+	printf '      %s\n' "$fail_list"
+	fi
+
+    # 배포 실패는 error/<host>에 기록하되 기존 Mage 방식처럼
+    # server 목록은 변경하지 않고 이후 local/remote를 계속 실행한다.
+    # 원본/인자/staging 오류만 위에서 return 1로 처리한다.
+    : "$deploy_salt_rc"
+    return 0
+}
+
+# file_deploy는 Sage 예약 함수/변수다.
+# local에서 같은 이름을 변수로 사용하거나 함수를 재정의하면 즉시 실패한다.
+readonly -f file_deploy
+readonly file_deploy=""
+
+# ============================================================
 # local 스크립트 실행
 # ============================================================
 # 최종 server 필터링 완료 후 Salt 실행 전에
@@ -1296,10 +1751,10 @@ run_user_local() {
         return 0
     fi
 
-    echo
-    echo "[ local 실행 ]"
+    sage_print_section "local 실행"
 
     (
+        export SAGE_LOCAL_ACTIVE=1
         cd "$base_dir"
         . "$local_file"
     )
@@ -1691,11 +2146,6 @@ if has_user_local; then
 	local_status="ON"
 fi
 
-remote_status="OFF"
-if [[ "$SALT_FUNCTION" == "cmd.run" && "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
-    remote_status="ON"
-fi
-
 post_status="OFF"
 if post_has_effective_content "$base_dir/post"; then
     case "${ASYNC:-false}" in
@@ -1711,85 +2161,140 @@ if post_has_effective_content "$base_dir/post"; then
 fi
 
 # ============================================================
-# Sage 실행 정보 요약
+# Salt 실행 제목
 # ============================================================
-echo
-echo "=========================================================================="
-echo
-echo "[ sage 실행 정보 ]"
-echo "server : ${server_summary:-기존 파일 사용}"
-echo "minion : ${minion_summary:-key 완료 / ping 완료}"
-echo
+salt_section_title="대상 서버 실행"
 
-printf 'local  : %-3s  %s\n' "$local_status" "$base_dir/local"
-printf 'remote : %-3s  %s\n' "$remote_status" "$base_dir/remote"
-printf 'post   : %-3s  %s\n' "$post_status" "$base_dir/post"
-echo
-echo "=========================================================================="
-echo
-echo "[ 실행 모드 ]"
-
-if (( ${#config_declared_options[@]} > 0 )); then
-    for option_name in "${config_declared_options[@]}"; do
-
-        # JID_CHUNK_SIZE가 실제 사용 중이면
-        # 아래 전용 영역에서 상세 내용을 함께 출력하므로 여기서는 제외
-        if [[ "$option_name" == "JID_CHUNK_SIZE" && -n "${JID_CHUNK_SIZE:-}" ]]; then
-            continue
-        fi
-
-        printf '%s=%s\n' \
-            "$option_name" \
-            "${config_declared_values[$option_name]-}"
-    done
-else
-    echo "별도 설정 없음 / 기본값 사용"
-fi
-
-# ============================================================
-# JID_CHUNK_SIZE 실행 정보
-# ============================================================
-# config 직접 설정 또는 대상 수 기준 자동 적용 여부와 관계없이
-# 실제 JID_CHUNK_SIZE가 사용되는 경우에만 출력한다.
-# ============================================================
-if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
-    echo
-    echo "JID_CHUNK_SIZE=$JID_CHUNK_SIZE"
-    echo "ㄴ 전체 대상 : ${server_count}대"
-    echo "ㄴ 분할 단위 : ${JID_CHUNK_SIZE}대"
-    echo "ㄴ 실행 횟수 : 총 ${jid_chunk_count}회"
-fi
-
-echo
-
-case "${ASYNC:-false}" in
-    true|TRUE|True|1|yes|YES|Yes|y|Y)
-        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-            echo "Salt job 등록 후 event 결과 수집"
+case "$SALT_FUNCTION" in
+    cmd.run)
+        if [[ "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
+            salt_section_title="remote 실행"
         else
-            echo "Salt job 등록 후 종료"
+            salt_section_title="cmd.run 실행"
         fi
         ;;
 
-    *)
-        if [[ -z "${JID_CHUNK_SIZE:-}" ]]; then
-            echo "Salt 결과 수집 후 종료"
+    state.apply)
+        salt_section_title="state.apply 실행"
+        ;;
+
+    state.single)
+        if [[ "${SALT_ARGS[0]:-}" == "file.managed" ]]; then
+            salt_section_title="file.managed 실행"
+        else
+            salt_section_title="state.single 실행"
         fi
         ;;
 esac
 
-echo "=========================================================================="
-if (( skip_count > 0 )); then
-    echo
-    echo "[ 제외 서버 : ${skip_count}대 ]"
-    awk '{print $1 "(" $2 ")"}' "$log_dir/server_fail" | paste -sd,
+# ============================================================
+# 실제 Salt 실행 방식 표시
+# ============================================================
+# sage 실행 정보의 가운데 항목과 실제 실행 섹션 제목을
+# SALT_FUNCTION/SALT_ARGS 기준으로 결정한다.
+salt_execution_name="Salt"
+salt_section_title="Salt 실행"
+
+case "$SALT_FUNCTION" in
+    cmd.run)
+        if [[ "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
+            salt_execution_name="remote"
+            salt_section_title="remote 실행"
+        else
+            salt_execution_name="cmd.run"
+            salt_section_title="cmd.run 실행"
+        fi
+        ;;
+
+    state.apply)
+        salt_execution_name="state.apply"
+        salt_section_title="state.apply 실행"
+        ;;
+
+    state.single)
+        if [[ "${SALT_ARGS[0]:-}" == "file.managed" ]]; then
+            salt_execution_name="file.managed"
+            salt_section_title="file.managed 실행"
+        else
+            salt_execution_name="state.single"
+            salt_section_title="state.single 실행"
+        fi
+        ;;
+esac
+
+# ============================================================
+# Sage 실행 정보 요약
+# ============================================================
+
+sage_print_section "sage 실행 정보"
+printf '  server : %s\n' "${server_summary:-기존 파일 사용}"
+printf '  minion : %s\n' "${minion_summary:-key 완료 / ping 완료}"
+echo
+printf '  %-13s : %s\n' "local" "$local_status"
+printf '  %-13s : %s\n' "$salt_execution_name" "ON"
+printf '  %-13s : %s\n' "post" "$post_status"
+
+sage_print_section "실행 모드"
+
+printed_mode_option=0
+
+if (( ${#config_declared_options[@]} > 0 )); then
+    for option_name in "${config_declared_options[@]}"; do
+
+        # 실제 JID_CHUNK_SIZE가 사용 중이면 아래 상세 영역에서 출력한다.
+		if [[ "$option_name" == "JID_CHUNK_SIZE" && -n "${JID_CHUNK_SIZE:-}" ]]; then
+            continue
+        fi
+
+        # EVENT_NOTIFY_LIB는 ASYNC_RESULT=true에서만 의미가 있다.
+        if [[ "$option_name" == "EVENT_NOTIFY_LIB" && "${ASYNC_RESULT_MODE:-0}" -ne 1 ]]; then
+            continue
+        fi
+
+        printf '  %-17s : %s\n' \
+            "$option_name" \
+            "${config_declared_values[$option_name]-}"
+        printed_mode_option=1
+    done
+fi
+
+if [[ "$printed_mode_option" -eq 0 && -z "${JID_CHUNK_SIZE:-}" ]]; then
+    echo "  별도 설정 없음 / 기본값 사용"
+fi
+
+if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
+    printf '  %-17s : %s\n' "JID_CHUNK_SIZE" "$JID_CHUNK_SIZE"
+    printf '  %-17s : %s대\n' "전체 대상" "$server_count"
+    printf '  %-17s : %s대\n' "분할 단위" "$JID_CHUNK_SIZE"
+    printf '  %-17s : 총 %s회\n' "실행 횟수" "$jid_chunk_count"
 fi
 
 echo
-echo "[ 실행 대상 : ${server_count}대 ]"
+case "${ASYNC:-false}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y)
+        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+            echo "  → Salt job 등록 후 event 결과 수집"
+		else
+            echo "  → Salt job 등록 후 종료"
+		fi
+        ;;
+    *)
+        echo "  → Salt 결과 수집 후 종료"
+		;;
+esac
+
+if (( skip_count > 0 )); then
+    sage_print_section "제외 서버 : ${skip_count}대"
+    printf '  '
+	awk '{print $1 "(" $2 ")"}' "$log_dir/server_fail" | paste -sd,
+fi
+
+sage_print_section "실행 대상 : ${server_count}대"
+printf '  '
 paste -sd, "$base_dir/server"
+
 echo
-echo "=========================================================================="
+sage_print_line
 echo
 # ============================================================
 # 사용자 실행 확인
@@ -1828,6 +2333,9 @@ case "$answer" in
         # 최종 server 필터링 완료 후, Salt 실행 전에 master 로컬에서 수행한다.
         run_user_local
 
+		# SALT_FUNCTION에 맞는 제목 출력
+		sage_print_section "$salt_section_title"
+
         . "$framework_dir/salt_apply"
 
         # sage 실행 히스토리 기록
@@ -1835,36 +2343,43 @@ case "$answer" in
         write_sage_history
 
         if [[ "${SALT_RC:-1}" -ne 0 ]]; then
-            echo "salt_apply 실패 또는 로그 파싱 불가"
+            echo
+            echo "  Salt 실행 실패 또는 로그 파싱 불가"
+            echo
+            sage_print_line
             exit 1
         fi
+
         case "${ASYNC:-false}" in
             true|TRUE|True|1|yes|YES|Yes|y|Y)
-                echo
-                if [[ -s "$log_dir/async_jid" ]]; then
-                    async_jid_value="$(cat "$log_dir/async_jid")"
-                    echo
-                    echo "============================================================"
-                    echo "ASYNC JID"
-                    echo "============================================================"
-                    echo "$async_jid_value"
-                    echo "------------------------------------------------------------"
-                    echo "결과 조회 명령어:"
-                    echo "salt-run jobs.lookup_jid $async_jid_value --out=json"
-                fi
+                sage_print_section "실행 완료"
+                echo "  Salt job 등록 완료"
 
+                if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+                    echo "  결과 수집 : event listener"
+                elif [[ -s "$log_dir/async_jid" ]]; then
+                    async_jid_value="$(head -n 1 "$log_dir/async_jid")"
+                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"
+				fi
+
+                echo
+                sage_print_line
                 exit 0
                 ;;
         esac
 
-        echo
-        echo "result 폴더에 결과 생성중..."
-
         # log_salt 파싱 후 result/error 디렉토리에 호스트별 결과 생성
         run_post
 
+        sage_print_section "결과 정리"
+        printf '  result : %s개\n' "${RESULT_FILE_COUNT:-0}"
+        printf '  error  : %s개\n' "${ERROR_FILE_COUNT:-0}"
+
         # result/error 생성 완료 후 사용자 post 스크립트 실행
         run_user_post
+
+        echo
+        sage_print_line
         ;;
 
     *)
@@ -1872,4 +2387,3 @@ case "$answer" in
         exit 0
         ;;
 esac
-

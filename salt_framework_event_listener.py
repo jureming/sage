@@ -122,6 +122,23 @@ def write_text_file(path, content):
         else:
             f.write("")
 
+def append_text_file(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if content is None:
+        content = ""
+
+    content = str(content).rstrip()
+    exists_with_content = os.path.exists(path) and os.path.getsize(path) > 0
+
+    with open(path, "a", encoding="utf-8") as f:
+        if exists_with_content and content:
+            f.write("\n")
+
+        if content:
+            f.write(content + "\n")
+        elif not os.path.exists(path):
+            f.write("")
 
 def post_has_effective_content(post_file):
     if not os.path.isfile(post_file):
@@ -162,20 +179,39 @@ def get_expected_hosts(base_dir):
 
 
 def get_done_hosts(base_dir):
+    # ASYNC_RESULT에서는 local의 file_deploy가 remote 실행 전에
+    # error/<host>를 만들 수 있다. result/error 존재만으로 완료를 판단하면
+    # remote event가 오기 전에 post가 조기 실행될 수 있으므로,
+    # listener가 실제 event를 처리한 host marker를 우선 사용한다.
+    marker_dir = os.path.join(base_dir, "log", "async_done_hosts")
     done = set()
 
+    if os.path.isdir(marker_dir):
+        try:
+            for name in os.listdir(marker_dir):
+                full_path = os.path.join(marker_dir, name)
+
+                if os.path.isfile(full_path):
+                    done.add(name)
+        except Exception:
+            pass
+
+        return done
+
+    # 기존 실행과의 호환을 위한 fallback
     for dirname in ("result", "error"):
         path = os.path.join(base_dir, dirname)
+
         try:
             for name in os.listdir(path):
                 full_path = os.path.join(path, name)
+
                 if os.path.isfile(full_path):
                     done.add(name)
         except Exception:
             continue
 
     return done
-
 
 def run_post_once(base_dir, run_id):
     log_dir = os.path.join(base_dir, "log")
@@ -320,14 +356,14 @@ def handle_async_done(payload):
             write_text_file(result_file, stdout_content)
             wrote_result = True
 
-        write_text_file(error_file, stderr_content)
+        append_text_file(error_file, stderr_content)
         wrote_error = True
 
     elif is_failed:
         if stdout_content:
-            write_text_file(error_file, stdout_content)
+            append_text_file(error_file, stdout_content)
         else:
-            write_text_file(error_file, "")
+            append_text_file(error_file, "")
 
         wrote_error = True
 
@@ -341,11 +377,17 @@ def handle_async_done(payload):
         write_text_file(result_file, stdout_content)
         wrote_result = True
 
-        try:
-            if os.path.exists(error_file):
-                os.remove(error_file)
-        except Exception:
-            pass
+        # local의 file_deploy가 남긴 error/<host>는 remote 성공이어도 유지한다.
+
+    # 성공/실패 여부와 관계없이 event를 받은 host는 완료 처리한다.
+    done_marker = os.path.join(
+        base_dir,
+        "log",
+        "async_done_hosts",
+        minion_id,
+    )
+
+    write_text_file(done_marker, "")
 
     log(
         f"async_result_written base_dir={base_dir} run_id={run_id} "
@@ -418,4 +460,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -39,6 +39,12 @@ PING_RETRY_SLEEP="${PING_RETRY_SLEEP:-2}"
 DEBUG_MODE="${DEBUG_MODE:-false}"
 DEBUG_PRINT="${DEBUG_PRINT:-false}"
 DEBUG_LOG="${DEBUG_LOG:-$log_dir/debug.log}"
+SALT_APPLY_CONTEXT="${SALT_APPLY_CONTEXT:-default}"
+SALT_OUTPUT_PREFIX="  "
+
+if [[ "$SALT_APPLY_CONTEXT" == "file_deploy" ]]; then
+    SALT_OUTPUT_PREFIX="    "
+fi
 
 mkdir -p "$base_dir/.tmp" "$log_dir"
 
@@ -206,7 +212,7 @@ draw_progress() {
     bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
     bar="$bar$(printf '%*s' "$empty" '' | tr ' ' ' ')"
 
-    printf "\r[%-40s] %3d%% (%d/%d)" "$bar" "$percent" "$done_count" "$total_count"
+    printf "\r%s[%-40s] %3d%% (%d/%d)" "$SALT_OUTPUT_PREFIX" "$bar" "$percent" "$done_count" "$total_count"
 }
 
 # ============================================================
@@ -276,7 +282,7 @@ draw_progress_with_prefix() {
     bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
     bar="$bar$(printf '%*s' "$empty" '' | tr ' ' ' ')"
 
-    printf "\r[%s] [%-40s] %3d%% (%d/%d)" "$chunk_label" "$bar" "$percent" "$done_count" "$total_count"
+    printf "\r%s[%s] [%-40s] %3d%% (%d/%d)" "$SALT_OUTPUT_PREFIX" "$chunk_label" "$bar" "$percent" "$done_count" "$total_count"
 }
 
 # ============================================================
@@ -1208,10 +1214,7 @@ fi
 #   - JID를 $log_dir/async_jid 에 저장
 # ============================================================
 if [[ "$ASYNC_MODE" -eq 1 ]]; then
-    echo "로그파일: $log"
-    echo "SALT START: $(date '+%F %T')"
-    echo "ASYNC MODE: true"
-    echo "ASYNC_RESULT: ${ASYNC_RESULT:-false}"
+    printf '  SALT START : %s\n' "$(date '+%F %T')"
 
     submit_log="$tmp_dir/async_submit"
     rm -f "$submit_log"
@@ -1230,23 +1233,29 @@ if [[ "$ASYNC_MODE" -eq 1 ]]; then
 
     set -e
 
-    cat "$submit_log" | tee -a "$log"
-
+    cat "$submit_log" >> "$log"
     async_jid="$(extract_jid_from_file "$submit_log")"
 
     if [[ -n "$async_jid" ]]; then
         echo "$async_jid" > "$async_jid_file"
-        echo "ASYNC JID: $async_jid"
-    else
-        echo "ASYNC JID 확인 실패"
-    fi
+        printf '  ASYNC JID  : %s\n' "$async_jid"
+	else
+        echo "  ASYNC JID 확인 실패"
+	fi
 
-    echo "SALT END: $(date '+%F %T')"
-    echo "SALT RETCODE: $salt_rc"
+    printf '  SALT END   : %s\n' "$(date '+%F %T')"
 
     if [[ "$salt_rc" -eq 0 && -n "$async_jid" ]]; then
         SALT_RC=0
     else
+        echo
+        printf '  SALT RETCODE : %s\n' "$salt_rc"
+
+        if [[ -s "$submit_log" ]]; then
+            echo "  Salt 실행 오류:"
+            sed 's/^/    /' "$submit_log"
+        fi
+
         SALT_RC=1
     fi
 
@@ -1288,10 +1297,8 @@ run_collect_by_jid_once() {
         "$term_log"
 
     if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
-        echo "로그파일: $log"
-        echo "SALT START: $(date '+%F %T')"
-        echo "COLLECT_BY_JID: true"
-    fi
+        printf '  SALT START : %s\n' "$(date '+%F %T')"
+	fi
 
     set +e
 
@@ -1311,15 +1318,16 @@ run_collect_by_jid_once() {
     debug_log "jid_submit rc=$submit_rc jid=$jid server_count=$server_count function=$SALT_FUNCTION args=${SALT_ARGS[*]}"
 
     if [[ "$submit_rc" -ne 0 || -z "$jid" ]]; then
-        echo
-        echo "Salt JID 발급 실패"
-        echo "------------------------------------------------------------"
-        cat "$submit_log"
-        echo "------------------------------------------------------------"
-        echo "SALT END: $(date '+%F %T')"
-        echo "SALT RETCODE: $submit_rc"
-        SALT_RC=1
+        echo "  Salt JID 발급 실패"
+        printf '  SALT END     : %s\n' "$(date '+%F %T')"
+        printf '  SALT RETCODE : %s\n' "$submit_rc"
 
+        if [[ -s "$submit_log" ]]; then
+            echo "  Salt 실행 오류:"
+            sed 's/^/    /' "$submit_log"
+        fi
+
+        SALT_RC=1
         return 0
     fi
 
@@ -1330,9 +1338,8 @@ run_collect_by_jid_once() {
     if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
         debug_log "jid_chunk_submit chunk=${JID_CHUNK_LABEL:-0/0} jid=$jid target_count=$server_count"
     else
-        echo
-        echo "JID: $jid"
-    fi
+        printf '  JID        : %s\n' "$jid"
+	fi
 
     poll_interval="$(normalize_number "${POLL_INTERVAL:-3}" 3)"
     job_wait_timeout="$(normalize_number "${JOB_WAIT_TIMEOUT:-300}" 300)"
@@ -1353,8 +1360,9 @@ run_collect_by_jid_once() {
     debug_log "poll_setup jid=$jid poll_interval=$poll_interval job_wait_timeout=$job_wait_timeout running_check_interval=$running_check_interval late_timeout=$late_check_timeout late_hard_timeout=$late_check_hard_timeout lookup_hard_timeout=$lookup_hard_timeout final_lookup_hard_timeout=$final_lookup_hard_timeout ping_parallel=$PING_CHECK_PARALLEL ping_retry=$PING_RETRY_COUNT ping_retry_sleep=$PING_RETRY_SLEEP"
 
     if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
-        echo "진행률 확인중... poll=${poll_interval}s timeout=${job_wait_timeout}s"
-    fi
+        echo
+        printf '  진행률 확인중... poll=%ss timeout=%ss\n' "$poll_interval" "$job_wait_timeout"
+	fi
     draw_progress_line 0 "$server_count"
 
     while true; do
@@ -1611,8 +1619,8 @@ run_collect_by_jid_once() {
 
    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
        echo
-       echo "JID 결과 최종 수집중..."
-   fi
+       echo "  JID 결과 최종 수집중..."
+	fi
    debug_log "final_lookup_start jid=$jid hard_timeout=$final_lookup_hard_timeout"
 
    set +e
@@ -1630,8 +1638,11 @@ run_collect_by_jid_once() {
    debug_log "final_lookup rc=$final_lookup_rc log_size=$(wc -c < "$log" 2>/dev/null || echo 0)"
 
    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
-       echo "SALT END: $(date '+%F %T')"
-       echo "SALT RETCODE: $final_lookup_rc"
+       printf '  SALT END   : %s\n' "$(date '+%F %T')"
+
+       if [[ "$final_lookup_rc" -ne 0 ]]; then
+           printf '  SALT RETCODE : %s\n' "$final_lookup_rc"
+       fi
    fi
 
    if [[ "$final_lookup_rc" -eq 0 && -s "$log" ]] && grep -q '{' "$log"; then
@@ -1694,15 +1705,12 @@ run_collect_by_jid_chunked() {
     poll_interval="$(normalize_number "${POLL_INTERVAL:-3}" 3)"
     job_wait_timeout="$(normalize_number "${JOB_WAIT_TIMEOUT:-300}" 300)"
 
-    echo "로그파일: $master_log"
-    echo "============================================================"
-    echo "JID 청크 실행 모드"
-    echo "============================================================"
-    echo "JID_CHUNK_SIZE: $chunk_size"
-    echo "전체 대상 수: $master_server_count"
-    echo "총 실행 횟수: $chunk_total"
-    echo "진행률 확인중... poll=${poll_interval}s timeout=${job_wait_timeout}s"
-    echo "------------------------------------------------------------"
+	if [[ "${SALT_APPLY_CONTEXT:-default}" != "file_deploy" ]]; then
+        printf '  SALT START : %s\n' "$(date '+%F %T')"
+        printf '  분할 실행  : %s대 × 총 %s회\n' "$chunk_size" "$chunk_total"
+        echo
+        printf '  진행률 확인중... poll=%ss timeout=%ss\n' "$poll_interval" "$job_wait_timeout"
+	fi
 
     JID_CHUNK_ACTIVE=1
     JID_CHUNK_TOTAL_TARGETS="$master_server_count"
@@ -1734,15 +1742,22 @@ run_collect_by_jid_chunked() {
 
         if [[ "${SALT_RC:-1}" -ne 0 ]]; then
             echo
-            echo "JID 청크 실행 실패: $chunk_label"
-            break
+            printf '%sJID 청크 실행 실패: %s\n' "$SALT_OUTPUT_PREFIX" "$chunk_label"
+			break
         fi
 
         JID_CHUNK_COMPLETED_BEFORE=$(( JID_CHUNK_COMPLETED_BEFORE + chunk_count ))
     done
 
-    echo
-    echo "JID 청크 실행 완료: ${chunk_no}/${chunk_total} 대상=${master_server_count} SALT_RETCODE=${SALT_RC:-1}"
+	echo
+
+	if [[ "${SALT_APPLY_CONTEXT:-default}" != "file_deploy" ]]; then
+        printf '  SALT END   : %s\n' "$(date '+%F %T')"
+
+        if [[ "${SALT_RC:-1}" -ne 0 ]]; then
+            printf '  SALT RETCODE : %s\n' "${SALT_RC:-1}"
+        fi
+	fi
 
     server_file="$master_server_file"
     server_list="$master_server_list"
@@ -1782,9 +1797,8 @@ if [[ -n "${BATCH:-}" ]]; then
     SALT_STREAM_OPT+=(-b "$BATCH")
 fi
 
-echo "로그파일: $log"
-echo "SALT START: $(date '+%F %T')"
-echo "COLLECT_BY_JID: false"
+printf '  SALT START : %s\n' "$(date '+%F %T')"
+echo
 
 draw_progress 0 "$server_count"
 
@@ -1829,8 +1843,11 @@ done_count=$(wc -l < "$completed")
 draw_progress "$done_count" "$server_count"
 
 echo
-echo "SALT END: $(date '+%F %T')"
-echo "SALT RETCODE: $salt_rc"
+printf '  SALT END   : %s\n' "$(date '+%F %T')"
+
+if [[ "$salt_rc" -ne 0 ]]; then
+    printf '  SALT RETCODE : %s\n' "$salt_rc"
+fi
 
 # ============================================================
 # Salt 결과 로그 검증
@@ -1844,6 +1861,3 @@ else
     echo "log_salt에 JSON 결과가 없습니다."
     SALT_RC=1
 fi
-
-
-
