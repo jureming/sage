@@ -73,7 +73,8 @@ while true; do
 			(.custom_fields.ip_internal | value_or_x),
 			(.custom_fields.ip_external | value_or_x),
 			(.primary_ip4.address? | ip_or_na),
-			(.primary_ip6.address? | ip_or_na)
+			(.primary_ip6.address? | ip_or_na),
+			(.site.name | value_or_x)
 			]
 	    | @tsv
 	' <<< "$response" >> "$vm_tmp"
@@ -139,7 +140,8 @@ mv -f -- "$vm_tmp" $base_dir/vm_inventory
 				(.custom_fields.ip_internal | value_or_x),
 				(.custom_fields.ip_external | value_or_x),
 				(.primary_ip4.address? | ip_or_na),
-				(.primary_ip6.address? | ip_or_na)
+				(.primary_ip6.address? | ip_or_na),
+				(.site.name | value_or_x)
 			]
 		    | @tsv
 		' <<< "$response" >> "$devices_total_tmp"
