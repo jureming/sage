@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+
+# vm_inventory 출력 순서
+# 이름  Role  Zone  OS버전  Service-unit  외부망  내부망  Primary IPv4  Primary IPv6
+#
+# device_inventory 출력 순서
+# 이름  Role  OS버전  외부망  내부망  Primary IPv4  Primary IPv6
+
+base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+devices_file="$base_dir/device_inventory"
+vm_file="$base_dir/vm_inventory"
+
+host_name="$(hostname -s 2>/dev/null || hostname)"
+host_name="${host_name%%.*}"
+
+# hostname별 VM Zone
+case "$host_name" in
+    master-demo)
+        zones=("demo-corp")
+        ;;
+
+    master-dev)
+        zones=("devs-corp")
+        ;;
+
+    salt01|salt02)
+        zones=("prod-corp" "prod-resl")
+        ;;
+
+    zmaster901)
+        zones=("prod-ncrt")
+        ;;
+
+    zmaster-test2)
+        zones=("test-cert")
+        ;;
+
+    master-test)
+        zones=("test-corp")
+        ;;
+
+    *)
+        echo "Zone 매핑이 없는 서버: $host_name" >&2
+        exit 1
+        ;;
+esac
+
+# 해당 Zone 전체 서버
+get_allservers() {
+    local zone
+
+    {
+        if [[ -f "$vm_file" ]]; then
+            for zone in "${zones[@]}"; do
+                awk -F '\t' -v value="$zone" '
+                    tolower($3) == tolower(value) {
+                        print $1
+                    }
+                ' "$vm_file"
+            done
+        fi
+
+        if [[ "$host_name" == "salt01" || "$host_name" == "salt02" ]]; then
+            if [[ -f "$devices_file" ]]; then
+                cut -f1 "$devices_file"
+            fi
+        fi
+    } | sort -u
+}
+
+# 해당 Zone 전체 VM 서버
+get_vm_allservers() {
+    local zone
+
+    {
+        if [[ -f "$vm_file" ]]; then
+            for zone in "${zones[@]}"; do
+                awk -F '\t' -v value="$zone" '
+                    tolower($3) == tolower(value) {
+                        print $1
+                    }
+                ' "$vm_file"
+            done
+        fi
+    } | sort -u
+}
+
+# 전체 Device 서버
+get_device_allservers() {
+    if [[ -f "$devices_file" ]]; then
+        cut -f1 "$devices_file" | sort -u
+    fi
+}
+
+# Zone 구분 없는 전체 서버
+get_real_allservers() {
+    {
+        if [[ -f "$devices_file" ]]; then
+            cut -f1 "$devices_file"
+        fi
+
+        if [[ -f "$vm_file" ]]; then
+            cut -f1 "$vm_file"
+        fi
+    } | sort -u
+}
+
+# 전체 메일 서버
+get_mailservers() {
+    {
+        if [[ -f "$vm_file" ]]; then
+            awk -F '\t' '
+                tolower($5) == "webmail_svc" {
+                    print $1
+                }
+            ' "$vm_file"
+        fi
+
+        echo "m10"
+    } | sort -u
+}
+
+# 단독 메일 서버
+get_valid_d_mailservers() {
+    if [[ -f "$vm_file" ]]; then
+        awk -F '\t' '
+            tolower($5) == "webmail_svc" &&
+            tolower($1) ~ /^m[0-9]+$/ &&
+            tolower($1) != "m10" {
+                print $1
+            }
+        ' "$vm_file" | sort -u
+    fi
+}
+
+# 통합 메일 서버
+get_valid_s_mailservers() {
+    {
+        if [[ -f "$vm_file" ]]; then
+            awk -F '\t' '
+                tolower($5) == "webmail_svc" &&
+                tolower($1) ~ /^m[a-f][0-9]+$/ {
+                    print $1
+                }
+            ' "$vm_file"
+        fi
+
+        echo "m10"
+    } | sort -u
+}
+
+# 리셀러 전용 메일 서버
+get_valid_resellers() {
+    if [[ -f "$vm_file" ]]; then
+        awk -F '\t' '
+            tolower($5) == "webmail_svc" &&
+            tolower($3) == "prod-resl" &&
+            tolower($1) ~ /^m[a-f][0-9]+$/ {
+                print $1
+            }
+        ' "$vm_file" | sort -u
+    fi
+}
+
+# 해당 Zone 전체 서버에서 메일 서버 제외
+get_non_mailservers() {
+    comm -23 \
+        <(get_allservers | sort -u) \
+        <(get_mailservers | sort -u)
+}
+
+# OS별 서버 조회
+#
+# VM:
+#   4번째 컬럼 = OS
+#
+# Device:
+#   3번째 컬럼 = OS
+#
+# 사용:
+#   get_os_servers "Rocky 8.10"
+#   get_os_servers "Ubuntu 22.04"
+get_os_servers() {
+    local os="${1:?OS를 입력하세요}"
+
+    {
+        if [[ -f "$vm_file" ]]; then
+            awk -F '\t' -v value="$os" '
+                tolower($4) == tolower(value) {
+                    print $1
+                }
+            ' "$vm_file"
+        fi
+
+        if [[ -f "$devices_file" ]]; then
+            awk -F '\t' -v value="$os" '
+                tolower($3) == tolower(value) {
+                    print $1
+                }
+            ' "$devices_file"
+        fi
+    } | sort -u
+}
+
+# Service-unit 기준
+#
+# VM:
+#   5번째 컬럼 = Service-unit
+#
+# 사용:
+#   get_service_unit_servers "webmail_SVC"
+#   get_service_unit_servers "N/A"
+get_service_unit_servers() {
+    local service_unit="${1:?Service-unit을 입력하세요}"
+
+    {
+        if [[ -f "$vm_file" ]]; then
+            awk -F '\t' -v value="$service_unit" '
+                tolower($5) == tolower(value) {
+                    print $1
+                }
+            ' "$vm_file"
+        fi
+
+        if [[ "${service_unit,,}" == "webmail_svc" ]]; then
+            echo "m10"
+        fi
+    } | sort -u
+}
+
+# Role 기준
+#
+# VM과 Device:
+#   2번째 컬럼 = Role
+#
+# 사용:
+#   get_role_servers "db_SRV"
+#   get_role_servers "Hypervisor"
+#   get_role_servers "Switch"
+get_role_servers() {
+    local role="${1:?Role을 입력하세요}"
+
+    {
+        if [[ -f "$vm_file" ]]; then
+            awk -F '\t' -v value="$role" '
+                tolower($2) == tolower(value) {
+                    print $1
+                }
+            ' "$vm_file"
+        fi
+
+        if [[ -f "$devices_file" ]]; then
+            awk -F '\t' -v value="$role" '
+                tolower($2) == tolower(value) {
+                    print $1
+                }
+            ' "$devices_file"
+        fi
+    } | sort -u
+}
+
+# ==============================================================================
+# 버전 목록
+# ==============================================================================
+#
+# OS 계열   | 지원 버전
+# ----------+-------------------------------------------------------------
+# Rocky     | 8.10, 9.5, 9.6, 9.7
+# Ubuntu    | 14.04, 16.04, 18.04, 20.04, 22.04, 24.04
+# Windows   | 10
+#
+# 조회:
+#   get_platform_servers "<NetBox Platform 이름>"
+#
+#
+# ===========================================================================================================================================
+#	Service Unit 분류 기준
+# ===========================================================================================================================================
+#
+# ┌────────────────────┬──────────────────────┬──────────────────────────────────┬──────────────────────────────────────────────────────────┐
+# │ Service Unit       │ 분류                 │ 대상 예시                        │ 설명                                                     │
+# ├────────────────────┼──────────────────────┼──────────────────────────────────┼──────────────────────────────────────────────────────────┤
+# │ webmail_SVC        │ 메일 서비스          │ m*, zm* 계열                     │ 메일 서버                                                │
+# │ mail_SVC           │ 메일 인프라          │ mx, relay, fwd, trans            │ 메일 서버 외 메일과 연관된 서버                          │
+# │ comm_SVC           │ 공통 인프라          │ api, app, front-app, db-px,      │ 여러 서비스가 공통으로 사용하는 서버                     │
+# │                    │                      │ upload 등                        │ 추가 세분화 없음                                         │
+# │ antispam_SVC       │ 스팸 차단            │ spam* 계열                       │                                                          │
+# │ inframgmt_SVC      │ 인프라 관리          │ netbox, pxe, infra-tmp 등        │ 인프라팀에서 관리하는 서버                               │
+# │ arc_SVC            │ 메일 아카이빙        │ arc* 계열                        │                                                          │
+# │ noti_SVC           │ 알림                 │ noti* 계열                       │                                                          │
+# │ dev_SVC            │ 개발 서버            │ dev 관련 서버                    │                                                          │
+# │ auth_SVC           │ 인증/로그인          │ auth, login                      │                                                          │
+# │ hp_SVC             │ 홈페이지/마이페이지  │ www, mypage, sms, krdom          │                                                          │
+# │ chat_SVC           │ 메신저               │ chat* 계열                       │                                                          │
+# │ deploy_SVC         │ 배포 자동화          │ runner, deploy, salt, ansible    │ 서버 설정 관리 및 소프트웨어 배포 자동화 파이프라인      │
+# │ member_SVC         │ 계정 정보(통합)      │ mem, member                      │                                                          │
+# │ crm_SVC            │ CRM                  │ crm* 계열                        │                                                          │
+# │ eas_SVC            │ 전자결재             │ eas* 계열                        │                                                          │
+# │ drive_SVC          │ 드라이브             │ drive, thumbnail                 │                                                          │
+# │ task_SVC           │ 태스크               │ task* 계열                       │                                                          │
+# │ pam_SVC            │ 접근 제어            │ warpgate, crowd, radius 등       │ 사내 계정·인증·접근 권한 관리                            │
+# │ reserve_SVC        │ 예약                 │ reserve* 계열                    │                                                          │
+# │ cal_SVC            │ 일정                 │ cal* 계열                        │                                                          │
+# │ worknote_SVC       │ 근태                 │ wn* 계열                         │                                                          │
+# │ backoffice_SVC     │ 내부 업무 도구       │ jira, wiki(Confluence)           │ 사내 업무 지원 플랫폼, 외부 고객 미노출                  │
+# │ bbs_SVC            │ 게시판               │ bbs* 계열                        │                                                          │
+# │ ai_SVC             │ AI 서비스            │ mcp 등 ai* 계열                  │ AI 도구 사용을 위한 서버                                 │
+# │ ns_SVC             │ 네임서버             │ ns* 계열                         │                                                          │
+# │ temporary_SVC      │ 임시 서버            │ u*, infra-tmp, build* 등         │ 역할 미확정 또는 임시 운영 서버                          │
+# │                    │                      │                                  │ 추후 적절한 Service Unit으로 재분류 필요                 │
+# └────────────────────┴──────────────────────┴──────────────────────────────────┴──────────────────────────────────────────────────────────┘
+#
+#
+# =====================================================================================================================================================
+#	Role 분류 기준
+# =====================================================================================================================================================
+#
+# ┌──────────────┬──────────────────────────┬────────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+# │ Role         │ 분류                     │ 설명                                               │ 주요 Service Unit                                  │
+# ├──────────────┼──────────────────────────┼────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+# │ app_SRV      │ 애플리케이션 서버        │ 비즈니스 로직 실행 담당                            │ webmail_SVC, antispam_SVC, chat_SVC, crm_SVC 등    │
+# │ api_SRV      │ API 서버                 │ 외부·내부 API 요청 처리 담당                       │ ai_SVC, antispam_SVC, comm_SVC                     │
+# │ px_SRV       │ 프록시/HA/로드밸런서     │ 프록시, 고가용성, 트래픽 분산                      │ mail_SVC, comm_SVC, auth_SVC 등                    │
+# │ db_SRV       │ 데이터베이스 서버        │ 데이터 저장 및 조회 처리                           │ comm_SVC, mail_SVC, noti_SVC 등                    │
+# │ misc_SRV     │ 기타 인프라 서버         │ 단일 카테고리로 분류하기 어려운 관리 서버          │ comm_SVC, deploy_SVC, inframgmt_SVC,               │
+# │              │                          │                                                    │ pam_SVC, temporary_SVC                             │
+# │ idx_SRV      │ 검색/인덱싱 서버         │ Elasticsearch 등 검색 및 인덱싱                    │ mail_SVC, arc_SVC, comm_SVC 등                     │
+# │ file_SRV     │ 파일 서버                │ 파일 저장 및 전송                                  │ mail_SVC, comm_SVC, arc_SVC 등                     │
+# │ mail_SRV     │ 메일 전송 서버           │ MX, relay 등 메일 전송 전용                        │ mail_SVC                                           │
+# │ web_SRV      │ 웹 서버                  │ 프론트엔드 웹 요청 처리                            │ comm_SVC, hp_SVC, arc_SVC 등                       │
+# │ mq_SRV       │ 메시지 큐 서버           │ 비동기 메시지 큐 처리                              │ mail_SVC, member_SVC, comm_SVC 등                  │
+# │ log_SRV      │ 로그 서버                │ 로그 수집 및 저장                                  │ comm_SVC                                           │
+# │ cache_SRV    │ 캐시 서버                │ Redis 등 캐시 처리                                 │ comm_SVC, chat_SVC                                 │
+# │ mon_SRV      │ 모니터링 서버            │ Zabbix, Sentry 등 모니터링                         │ comm_SVC, inframgmt_SVC                            │
+# │ bastion_SRV  │ 접근 제어 관문           │ SSH bastion, master 등 서버 접근 통제              │ pam_SVC                                            │
+# │ dns_SRV      │ DNS 서버                 │ DNS 질의 처리                                      │ ns_SVC                                             │
+# │ backup_SRV   │ 백업 서버                │ 백업 데이터 저장 및 복구                           │ comm_SVC, inframgmt_SVC, mail_SVC 등               │
+# └──────────────┴──────────────────────────┴────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+#  
+#  Devices Role
+# ┌──────────────┬
+# │ Role         │
+# ├──────────────┼
+# │ Baremetal    │
+# │ Hypervisor   │
+# │ Spare        │
+# │ Switch       │
+# │ UTM          │
+# └──────────────┴
+
+
