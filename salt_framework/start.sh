@@ -1937,12 +1937,39 @@ fi
 # ============================================================
 # Salt에 등록된 accepted minion 목록 생성
 # ============================================================
-minion_summary="key 완료 / ping 완료"
 
-salt-key -l accepted 2>/dev/null \
-    | sed '1d;s/^[[:space:]]*//' \
-    | awk 'NF' \
-    | sort -u > "$tmp_dir/server_accepted"
+accepted_nodes="${KEY_FILE:-$framework_dir/__cache__/accepted_nodes}"
+minion_summary="accepted_nodes 확인 / ping 완료"
+
+if [[ ! -f "$accepted_nodes" ]]; then
+    echo "accepted_nodes 없음: $accepted_nodes"
+    exit 1
+fi
+
+awk '
+    /^[[:space:]]*$/ {
+        next
+    }
+
+    /^[[:space:]]*#/ {
+        next
+    }
+
+    /^[[:space:]]*(Accepted|Unaccepted|Rejected|Denied)[[:space:]]+Keys:/ {
+        next
+    }
+
+    {
+        print $1
+    }
+' "$accepted_nodes" \
+    | sort -u \
+    > "$tmp_dir/server_accepted"
+
+if [[ ! -s "$tmp_dir/server_accepted" ]]; then
+    echo "accepted_nodes에 유효한 minion 목록이 없습니다: $accepted_nodes"
+    exit 1
+fi
 
 # comm 비교를 위해 양쪽 파일 정렬
 sort -u "$tmp_dir/server_target" -o "$tmp_dir/server_target"
