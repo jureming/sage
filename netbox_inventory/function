@@ -6,9 +6,9 @@
 # device_inventory 출력 순서
 # 이름  Role  OS버전  외부망  내부망  Primary IPv4  Primary IPv6
 
-base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-devices_file="$base_dir/device_inventory"
-vm_file="$base_dir/vm_inventory"
+netbox_inventory_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+devices_file="$netbox_inventory_dir/device_inventory"
+vm_file="$netbox_inventory_dir/vm_inventory"
 
 host_name="$(hostname -s 2>/dev/null || hostname)"
 host_name="${host_name%%.*}"
@@ -336,7 +336,7 @@ get_role_servers() {
 # │ dns_SRV      │ DNS 서버                 │ DNS 질의 처리                                      │ ns_SVC                                             │
 # │ backup_SRV   │ 백업 서버                │ 백업 데이터 저장 및 복구                           │ comm_SVC, inframgmt_SVC, mail_SVC 등               │
 # └──────────────┴──────────────────────────┴────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
-#  
+#
 #  Devices Role
 # ┌──────────────┬
 # │ Role         │
