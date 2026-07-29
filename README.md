@@ -9,10 +9,21 @@
   sage
   start.sh
   salt_apply
-
-/data/salt/common/
   salt_framework_event_notify.sh
   salt_framework_event_listener.py
+
+/data/salt/common/netbox_inventory/
+  refresh_inventory.sh
+  function
+  pillar_make.sh
+  accepted_nodes_sync.sh
+
+/data/salt/common/sample/
+  README
+  config
+  local
+  remote
+  post
 
 /data/salt/manual/<분류>/<작업명>/
   config
@@ -25,8 +36,13 @@
 - `salt_framework/sage`: `/data/salt/common/salt_framework/start.sh`를 실행하는 launcher입니다.
 - `salt_framework/start.sh`: 작업 디렉토리 결정, `config` 로드, 대상 서버 준비, 실행 전 검증을 담당합니다.
 - `salt_framework/salt_apply`: 실제 Salt 실행, JID 수집, 결과 분류를 담당합니다.
-- `salt_framework_event_notify.sh`: `ASYNC_RESULT=true`일 때 minion에서 실행 결과 event를 전송합니다.
-- `salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 marker 기준으로 완료되면 `post`를 실행합니다.
+- `salt_framework/salt_framework_event_notify.sh`: `ASYNC_RESULT=true`일 때 minion에서 실행 결과 event를 전송합니다.
+- `salt_framework/salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 marker 기준으로 완료되면 `post`를 실행합니다.
+- `netbox_inventory/refresh_inventory.sh`: NetBox에서 VM/Device inventory를 갱신하고 pillar 및 accepted key cache 갱신 스크립트를 실행합니다.
+- `netbox_inventory/function`: NetBox inventory 기준으로 자주 쓰는 서버 목록 조회 함수를 제공합니다.
+- `netbox_inventory/pillar_make.sh`: `vm_inventory` 기준으로 `/srv/pillar`의 minion pillar 파일을 생성합니다.
+- `netbox_inventory/accepted_nodes_sync.sh`: `salt-key -l accepted` 결과를 `salt_framework/__cache__/accepted_nodes`로 갱신합니다.
+- `sample/`: `sage -i`에서 복사하는 신규 작업 기본 샘플입니다.
 
 ## 실행 방법
 
@@ -161,8 +177,9 @@ file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
 | `make_server()` | 없음 | 정의되어 있고 실제 로직이 있으면 실행 전에 `$base_dir/server`를 생성합니다. 결과가 비면 기존 `server`를 사용합니다. |
-| `SKIP_PING` | `false` | `true`이면 `test.ping` 검사를 생략하고 salt-key accepted 서버를 실행 대상으로 사용합니다. |
+| `SKIP_PING` | `false` | `true`이면 `test.ping` 검사를 생략하고 accepted key cache에 있는 서버를 실행 대상으로 사용합니다. |
 | `DIRTY_NODES_FILE` | `/data/salt/common/dirty_nodes` | 실행에서 제외할 host 목록 파일입니다. 제외 사유는 `log/server_fail`에 `dirty_nodes`로 기록됩니다. |
+| `KEY_FILE` | `$framework_dir/__cache__/accepted_nodes` | accepted key 목록 cache 파일입니다. `start.sh`는 `salt-key`를 직접 조회하지 않고 이 파일을 기준으로 등록 여부를 확인합니다. |
 
 실행 모드 옵션:
 
@@ -238,6 +255,52 @@ systemctl status salt-framework-event.service
 
 listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다. 모든 대상 host의 `log/async_done_hosts/<host>` marker가 생성되면 `post`가 유효할 때 한 번만 실행합니다.
 
+## NetBox inventory
+
+`netbox_inventory/refresh_inventory.sh`는 NetBox API에서 VM/Device 정보를 조회해 아래 파일을 갱신합니다.
+
+```text
+/data/salt/common/netbox_inventory/vm_inventory
+/data/salt/common/netbox_inventory/device_inventory
+```
+
+`vm_inventory`에는 name, role, zone, platform, service_unit, IP, site, cluster, vm_zone, backup, deploy exception, template 정보가 저장됩니다. `device_inventory`에는 name, role, platform, IP, site 정보가 저장됩니다.
+
+inventory 갱신 후 아래 작업도 이어서 실행합니다.
+
+```bash
+bash /data/salt/common/netbox_inventory/pillar_make.sh
+bash /data/salt/common/netbox_inventory/accepted_nodes_sync.sh
+```
+
+`accepted_nodes_sync.sh`는 `salt-key -l accepted` 조회 결과를 `/data/salt/common/salt_framework/__cache__/accepted_nodes`에 저장합니다. `start.sh`는 실행 때마다 `salt-key`를 직접 호출하지 않고 이 cache 파일로 accepted minion 여부를 확인합니다. cache 파일이 없거나 비어 있으면 실행을 중단합니다.
+
+`function` 파일은 `config`에서 source 해서 사용할 수 있습니다.
+
+```bash
+make_server() {
+    . /data/salt/common/netbox_inventory/function
+    get_allservers > "$base_dir/server"
+}
+```
+
+주요 함수:
+
+| 함수 | 설명 |
+| --- | --- |
+| `get_allservers` | 현재 salt-master Zone 기준 전체 서버입니다. `salt01`, `salt02`에서는 Device 서버도 포함합니다. |
+| `get_vm_allservers` | 현재 salt-master Zone 기준 VM 서버입니다. |
+| `get_device_allservers` | 전체 Device 서버입니다. |
+| `get_real_allservers` | Zone 구분 없는 전체 VM/Device 서버입니다. |
+| `get_mailservers` | 전체 메일 서버입니다. |
+| `get_valid_d_mailservers` | 단독 메일 서버입니다. |
+| `get_valid_s_mailservers` | 통합 메일 서버입니다. |
+| `get_valid_resellers` | 리셀러 전용 메일 서버입니다. |
+| `get_non_mailservers` | 현재 Zone 전체 서버 중 메일 서버를 제외한 목록입니다. |
+| `get_os_servers "<OS>"` | OS 기준 서버입니다. |
+| `get_service_unit_servers "<Service-unit>"` | Service-unit 기준 서버입니다. |
+| `get_role_servers "<Role>"` | Role 기준 서버입니다. |
+
 ## 의존 명령
 
 - `bash`
@@ -251,6 +314,7 @@ listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_
 
 - `config`는 Bash로 `source`됩니다. 신뢰 가능한 작업 디렉토리에서만 사용하세요.
 - `base_dir`, `home_dir`, `apply_dir`은 `start.sh`가 다시 고정합니다. config에서 같은 이름을 선언해도 실행 기준은 `start.sh`가 결정한 값입니다.
+- accepted key 목록은 `salt_framework/__cache__/accepted_nodes` cache 파일 기준입니다. 최신화는 `netbox_inventory/accepted_nodes_sync.sh` 또는 `refresh_inventory.sh`로 수행합니다.
 - `ASYNC=true` 단독 모드는 job만 등록하고 `result/`, `error/`, `post` 처리를 하지 않습니다.
 - 실패 분류는 stderr를 우선합니다. stderr가 있으면 stdout은 `result/`, stderr는 `error/`에 저장됩니다.
 - `file_deploy`가 먼저 만든 `error/<host>`는 이후 remote 결과 처리에서 삭제하지 않고 append 방식으로 유지합니다.
