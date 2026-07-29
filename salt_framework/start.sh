@@ -66,17 +66,88 @@ target_path="${SAGE_BASE_DIR:-}"
 # 사용법 출력
 # ============================================================
 print_usage() {
-    echo "사용법: sage [-y|--yes] [--keep-tmp] [-d|--debug] [-i|--init <작업경로>] [manual/작업분류/작업명|cron/작업분류/작업명|절대경로]"
-	echo
-	echo "  경로 생략 시 현재 디렉토리를 작업 디렉토리로 사용합니다."
-    echo
-	echo "  -y, --yes            : 실행 확인 질문 없이 바로 실행합니다."
-    echo "  --keep-tmp           : 종료 후 .tmp 디렉토리를 삭제하지 않습니다."
-    echo "  -d, --debug          : 디버그 모드 활성화(debug.log 기록 + 화면 출력)."
-    echo "  -i, --init <작업명>  : sample 디렉토리를 복사해 새 작업 디렉토리를 생성합니다."
-    echo "                         현재 디렉토리 기준으로 생성합니다(절대경로도 가능)."
-    echo "                         예) sage -i backup"
-    echo "  -h, --help           : 이 도움말을 출력합니다."
+    cat <<'EOF'
+사용법: sage [-y|--yes] [--keep-tmp] [-d|--debug] [-i|--init <작업경로>] [작업경로]
+
+경로를 생략하면 현재 디렉토리를 작업 디렉토리로 사용합니다.
+
+옵션:
+  -y, --yes            실행 확인 없이 바로 실행
+  --keep-tmp           실행 종료 후 .tmp 디렉토리 유지
+  -d, --debug          debug.log 기록 및 디버그 내용 화면 출력
+  -i, --init <경로>    sample을 복사해 작업 디렉토리 생성
+  -h, --help           도움말 출력
+
+config 주요 설정:
+  TIMEOUT                    Salt 명령 통신 timeout(초)
+                             기본값: 3
+
+  SKIP_PING                  실행 전 전체 대상 서버의 test.ping 확인 생략
+                             true/false, 기본값: false
+
+  ASYNC                      Salt job 등록 후 결과를 기다리지 않고 종료
+                             true/false, 기본값: false
+                             true이면 result/error 생성 및 post 실행 안 함
+
+  ASYNC_RESULT               비동기 작업 완료 결과를 event로 수집
+                             true/false, 기본값: false
+                             minion 작업 완료 시 result/error를 개별 생성
+                             수집 로그: /var/log/salt/framework_event_listener.log
+
+  COLLECT_BY_JID             JID 기반 결과 수집 사용 여부
+                             true/false, 기본값: true
+                             true : 대상이 많거나 결과 내용이 큰 작업에 권장
+                             false: 대상과 결과 내용이 모두 작은 작업에 적합
+
+  JID_CHUNK_SIZE             대상을 지정한 서버 수 단위로 분할 실행
+                             기본값: 미설정
+                             미설정: 대상이 200대 초과하면 200 자동 적용
+                             빈 값/0: 자동 분할 해제
+                             양의 정수: 지정한 서버 수 단위로 분할
+
+  JOB_WAIT_TIMEOUT           JID 작업 완료 대기시간(초)
+                             기본값: 300
+                             0: 완료될 때까지 제한 없이 대기
+                             Salt job cache 보관시간을 초과하면
+                             최종 결과를 수집하지 못할 수 있음
+
+  BATCH                      기존 stdout 수집 방식의 batch 크기
+                             기본값: 미사용
+                             COLLECT_BY_JID=false일 때만 적용
+
+  FILE_DEPLOY_WAIT_TIMEOUT   file_deploy 결과 대기시간(초)
+                             기본값: 7200
+
+사용 가능 조합:
+1. 일반 작업 · 권장
+   별도 설정 없음
+
+     기본 JID 결과 수집을 사용하며,
+     대상이 200대 초과하면 200대씩 자동 분할합니다.
+
+2. 소규모 · 결과 내용이 작은 작업
+   COLLECT_BY_JID="false"
+
+3. job 등록 후 즉시 종료
+   ASYNC="true"
+
+     result/error 생성 및 post 실행을 하지 않습니다.
+
+4. 비동기 결과 event 수집
+   ASYNC="true"
+   ASYNC_RESULT="true"
+
+     cmd.run + **RUN\_SCRIPT** 실행에서만 사용할 수 있습니다.
+
+사용 불가 조합:
+  ASYNC_RESULT="true" + ASYNC="false"
+  ASYNC_RESULT="true" + cmd.run/**RUN\_SCRIPT** 외 실행 방식
+  JID_CHUNK_SIZE="양의 정수" + ASYNC="true"
+  JID_CHUNK_SIZE="양의 정수" + COLLECT_BY_JID="false"
+
+참고:
+  BATCH는 ASYNC="false" + COLLECT_BY_JID="false" 조합에서만 적용됩니다.
+EOF
 }
 
 # ============================================================
