@@ -39,6 +39,10 @@ case "$host_name" in
         zones=("test-corp")
         ;;
 
+    zmaster101)
+        zones=("prod-cert")
+        ;;
+
     *)
         echo "Zone 매핑이 없는 서버: $host_name" >&2
         exit 1
@@ -347,5 +351,4 @@ get_role_servers() {
 # │ Switch       │
 # │ UTM          │
 # └──────────────┴
-
 
