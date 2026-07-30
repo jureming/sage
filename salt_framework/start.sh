@@ -104,6 +104,11 @@ config 주요 설정:
                              미설정: 대상이 200대 초과하면 200 자동 적용
                              빈 값/0: 자동 분할 해제
                              양의 정수: 지정한 서버 수 단위로 분할
+                             기본적으로 대상 목록을 랜덤 셔플 후 분할
+
+  JID_CHUNK_RANDOMIZE        JID_CHUNK_SIZE 분할 전 대상 목록 랜덤 셔플
+                             true/false, 기본값: true
+                             false: 정렬된 최종 server 목록 순서대로 분할
 
   JOB_WAIT_TIMEOUT           JID 작업 완료 대기시간(초)
                              기본값: 300
@@ -119,29 +124,29 @@ config 주요 설정:
                              기본값: 7200
 
 사용 가능 조합:
-1. 일반 작업 · 권장
-   별도 설정 없음
+  1. 일반 작업 · 권장
+     별도 설정 없음
 
      기본 JID 결과 수집을 사용하며,
      대상이 200대 초과하면 200대씩 자동 분할합니다.
 
-2. 소규모 · 결과 내용이 작은 작업
-   COLLECT_BY_JID="false"
+  2. 소규모 · 결과 내용이 작은 작업
+     COLLECT_BY_JID="false"
 
-3. job 등록 후 즉시 종료
-   ASYNC="true"
+  3. job 등록 후 즉시 종료
+     ASYNC="true"
 
      result/error 생성 및 post 실행을 하지 않습니다.
 
-4. 비동기 결과 event 수집
-   ASYNC="true"
-   ASYNC_RESULT="true"
+  4. 비동기 결과 event 수집
+     ASYNC="true"
+     ASYNC_RESULT="true"
 
-     cmd.run + **RUN\_SCRIPT** 실행에서만 사용할 수 있습니다.
+     cmd.run + __RUN_SCRIPT__ 실행에서만 사용할 수 있습니다.
 
 사용 불가 조합:
   ASYNC_RESULT="true" + ASYNC="false"
-  ASYNC_RESULT="true" + cmd.run/**RUN\_SCRIPT** 외 실행 방식
+  ASYNC_RESULT="true" + cmd.run/__RUN_SCRIPT__ 외 실행 방식
   JID_CHUNK_SIZE="양의 정수" + ASYNC="true"
   JID_CHUNK_SIZE="양의 정수" + COLLECT_BY_JID="false"
 
@@ -655,6 +660,7 @@ case "${ASYNC:-false}" in
         ;;
 esac
 
+
 # ============================================================
 # COLLECT_BY_JID 옵션 검증
 # true 계열이면 JID 기반 수집 모드
@@ -747,7 +753,10 @@ esac
 #   - config에 양의 정수를 선언하면 해당 개수 단위로 나눠 실행한다.
 #   - config에 선언하지 않았고 최종 실행 대상이 200대를 초과하면
 #     JID_CHUNK_SIZE=200을 자동 적용한다.
-#   - 최종 server 목록을 청크 단위로 나눠 JID 기반으로 순차 실행한다.
+#   - 최종 server 목록을 랜덤 셔플한 뒤 청크 단위로 나눠
+#     JID 기반으로 순차 실행한다.
+#   - JID_CHUNK_RANDOMIZE=false이면 랜덤 셔플 없이
+#     정렬된 최종 server 목록 순서대로 분할한다.
 #
 # 제한:
 #   - ASYNC=true와 같이 사용할 수 없다.
@@ -766,6 +775,20 @@ case "${JID_CHUNK_SIZE:-}" in
         if (( 10#$JID_CHUNK_SIZE < 1 )); then
             JID_CHUNK_SIZE=""
         fi
+        ;;
+esac
+
+case "${JID_CHUNK_RANDOMIZE:-true}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y|"")
+        JID_CHUNK_RANDOMIZE="true"
+        ;;
+    false|FALSE|False|0|no|NO|No|n|N)
+        JID_CHUNK_RANDOMIZE="false"
+        ;;
+    *)
+        echo "JID_CHUNK_RANDOMIZE 값이 올바르지 않습니다: ${JID_CHUNK_RANDOMIZE}"
+        echo "사용 가능 값: true, false"
+        exit 1
         ;;
 esac
 
@@ -1027,7 +1050,7 @@ run_post() {
 
 	# start.sh 시작 단계에서 이미 이전 실행 결과를 초기화한다.
 	# local의 file_deploy가 먼저 만든 error/<host>를 유지해야 하므로
-	# 여기서는 result/error를 다시 삭제하지 않고 디렉토리만 보장한다.
+	# 여기서는 result/error를 다시 삭제하지 않고 디렉토리만 보장한다. 
 	mkdir -p "$result_dir" "$error_dir"
 
     # ============================================================
@@ -1038,7 +1061,7 @@ run_post() {
     #
 	# 결과 저장 정책:
 	#   result/<host>
-	#     - 정상 결과의 stdout 저장
+	#     - 정상 결과의 stdout 저장 
 	#     - 정상 결과에 stdout이 없으면 빈 파일 생성
 	#
 	#   error/<host>
@@ -1048,7 +1071,7 @@ run_post() {
 	#     - state 실패 시 stderr가 없으면 실패 comment 저장
 	#     - state 실패 시 stderr/comment가 모두 없으면 no_stderr 저장
 	#
-	#   성공 상태의 comment는 저장하지 않는다.
+	#   성공 상태의 comment는 저장하지 않는다. 
 	# ============================================================
     python3 - "$log" "$server_file" "$result_dir" "$error_dir" <<'PY'
 import json
@@ -1285,19 +1308,19 @@ with open(returned_path, "w", encoding="utf-8") as out:
 PY
 
 	append_error_content() {
-	local host="$1"
-	local content="$2"
-	local error_file="$error_dir/$host"
+    	local host="$1"
+    	local content="$2"
+    	local error_file="$error_dir/$host"
 
-	if [[ -s "$error_file" && -n "$content" ]]; then
-	echo >> "$error_file"
-	fi
+    	if [[ -s "$error_file" && -n "$content" ]]; then
+        	echo >> "$error_file"
+    	fi
 
-	if [[ -n "$content" ]]; then
-	printf '%s\n' "$content" >> "$error_file"
-	elif [[ ! -e "$error_file" ]]; then
-	: > "$error_file"
-	fi
+    	if [[ -n "$content" ]]; then
+        	printf '%s\n' "$content" >> "$error_file"
+    	elif [[ ! -e "$error_file" ]]; then
+        	: > "$error_file"
+    	fi
 	}
     returned_hosts_file="${tmp_dir:-$base_dir/.tmp}/post_returned_hosts"
 
@@ -1325,7 +1348,7 @@ PY
 				continue
 			fi
 
-			append_error_content "$host" "$status"
+			append_error_content "$host" "$status"	
 		done < "$result_status"
     fi
 
@@ -1345,20 +1368,20 @@ PY
 		if [[ -s "$returned_hosts_file" ]] && grep -Fxq "$host" "$returned_hosts_file"; then
 		    continue
 		fi
-
+		
 		# result_status에 이미 분류된 host면 해당 상태를 사용한다.
 		if [[ -s "$result_status" ]] && awk -F '\t' -v target="$host" '$1 == target {found=1} END {exit !found}' "$result_status"; then
 		    continue
 		fi
-
+		
 		# file_deploy error가 이미 있어도 remote no_return은 뒤에 추가한다.
 		if [[ ! -f "$result_dir/$host" ]]; then
 		    append_error_content "$host" "no_return"
-		fi
+		fi	
 	done < "$server_file"
-
+	
 	RESULT_FILE_COUNT="$(find "$result_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-	ERROR_FILE_COUNT="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+	ERROR_FILE_COUNT="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"	
 }
 # ============================================================
 # 사용자 post 스크립트 사용 여부 확인
@@ -1789,11 +1812,11 @@ file_deploy() {
 	printf '    성공/실패 : %s / %s\n' "$success_count" "$fail_count"
 
 	if (( fail_count > 0 )); then
-	echo
-	echo "    실패 서버"
-	printf '      %s\n' "$fail_list"
+    	echo
+    	echo "    실패 서버"
+    	printf '      %s\n' "$fail_list"
 	fi
-
+	
     # 배포 실패는 error/<host>에 기록하되 기존 Mage 방식처럼
     # server 목록은 변경하지 않고 이후 local/remote를 계속 실행한다.
     # 원본/인자/staging 오류만 위에서 return 1로 처리한다.
@@ -2364,6 +2387,11 @@ if [[ -n "${JID_CHUNK_SIZE:-}" ]]; then
     printf '  %-17s : %s\n' "JID_CHUNK_SIZE" "$JID_CHUNK_SIZE"
     printf '  %-17s : %s대\n' "전체 대상" "$server_count"
     printf '  %-17s : %s대\n' "분할 단위" "$JID_CHUNK_SIZE"
+    if [[ "${JID_CHUNK_RANDOMIZE:-true}" == "false" ]]; then
+        printf '  %-17s : %s\n' "분할 순서" "정렬 순서"
+    else
+        printf '  %-17s : %s\n' "분할 순서" "랜덤 셔플"
+    fi
     printf '  %-17s : 총 %s회\n' "실행 횟수" "$jid_chunk_count"
 fi
 
@@ -2371,7 +2399,7 @@ echo
 case "${ASYNC:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
         if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-            echo "  → Salt job 등록 후 event 결과 수집"
+            echo "  → Salt job 등록 후 event 결과 수집"		
 		else
             echo "  → Salt job 등록 후 종료"
 		fi
@@ -2415,6 +2443,7 @@ case "$answer" in
         [[ -n "${ASYNC_RESULT:-}" ]] && export ASYNC_RESULT
         [[ -n "${COLLECT_BY_JID:-}" ]] && export COLLECT_BY_JID
         [[ -n "${JID_CHUNK_SIZE:-}" ]] && export JID_CHUNK_SIZE
+        [[ -n "${JID_CHUNK_RANDOMIZE:-}" ]] && export JID_CHUNK_RANDOMIZE
         [[ -n "${POLL_INTERVAL:-}" ]] && export POLL_INTERVAL
         [[ -n "${JOB_WAIT_TIMEOUT:-}" ]] && export JOB_WAIT_TIMEOUT
         [[ -n "${LATE_CHECK_TIMEOUT:-}" ]] && export LATE_CHECK_TIMEOUT
@@ -2457,7 +2486,7 @@ case "$answer" in
                     echo "  결과 수집 : event listener"
                 elif [[ -s "$log_dir/async_jid" ]]; then
                     async_jid_value="$(head -n 1 "$log_dir/async_jid")"
-                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"
+                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"                
 				fi
 
                 echo

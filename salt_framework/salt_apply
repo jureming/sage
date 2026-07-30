@@ -46,6 +46,7 @@ if [[ "$SALT_APPLY_CONTEXT" == "file_deploy" ]]; then
     SALT_OUTPUT_PREFIX="    "
 fi
 
+
 mkdir -p "$base_dir/.tmp" "$log_dir"
 
 # 이전 로그 및 완료 목록 초기화
@@ -1297,7 +1298,7 @@ run_collect_by_jid_once() {
         "$term_log"
 
     if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
-        printf '  SALT START : %s\n' "$(date '+%F %T')"
+        printf '  SALT START : %s\n' "$(date '+%F %T')" 
 	fi
 
     set +e
@@ -1326,7 +1327,7 @@ run_collect_by_jid_once() {
             echo "  Salt 실행 오류:"
             sed 's/^/    /' "$submit_log"
         fi
-
+ 
         SALT_RC=1
         return 0
     fi
@@ -1669,9 +1670,34 @@ run_collect_by_jid_once() {
 # COLLECT_BY_JID=true + JID_CHUNK_SIZE 처리
 # ============================================================
 # Salt 기본 batch(-b)를 쓰지 않고, 최종 server 목록을 지정한 개수로
-# 분할한 뒤 각 묶음을 salt --async JID 단위로 순차 실행한다.
+# 랜덤 셔플 후 분할한 뒤 각 묶음을 salt --async JID 단위로 순차 실행한다.
 # 각 chunk의 최종 lookup_jid 결과는 log/log_salt에 누적한다.
 # ============================================================
+write_randomized_server_file() {
+    local input_file="$1"
+    local output_file="$2"
+
+    python3 - "$input_file" "$output_file" <<'PY_RANDOM_SERVER'
+import random
+import sys
+
+input_path, output_path = sys.argv[1:]
+
+with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+    targets = [
+        line.rstrip("\r\n")
+        for line in f
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+random.SystemRandom().shuffle(targets)
+
+with open(output_path, "w", encoding="utf-8") as out:
+    for target in targets:
+        out.write(target + "\n")
+PY_RANDOM_SERVER
+}
+
 run_collect_by_jid_chunked() {
     local chunk_size="${JID_CHUNK_SIZE:-}"
     local master_server_file="$server_file"
@@ -1686,6 +1712,8 @@ run_collect_by_jid_chunked() {
     local chunk_log=""
     local chunk_label=""
     local chunk_files=()
+    local chunk_source_file=""
+    local chunk_order_label=""
 
     if [[ -z "$chunk_size" || ! "$chunk_size" =~ ^[0-9]+$ || "$chunk_size" -lt 1 ]]; then
         echo "JID_CHUNK_SIZE 값이 올바르지 않습니다: ${JID_CHUNK_SIZE:-}"
@@ -1698,7 +1726,21 @@ run_collect_by_jid_chunked() {
     : > "$master_log"
     : > "$async_jid_file"
 
-    split -l "$chunk_size" -d -a 4 "$master_server_file" "$chunk_dir/server_"
+    chunk_source_file="$master_server_file"
+    chunk_order_label="정렬 순서"
+
+    if is_true_value "${JID_CHUNK_RANDOMIZE:-true}"; then
+        chunk_source_file="$chunk_dir/randomized_targets"
+        chunk_order_label="랜덤 셔플"
+
+        if ! write_randomized_server_file "$master_server_file" "$chunk_source_file"; then
+            echo "JID 청크 대상 목록 랜덤 셔플 실패"
+            SALT_RC=1
+            return 0
+        fi
+    fi
+
+    split -l "$chunk_size" -d -a 4 "$chunk_source_file" "$chunk_dir/server_"
     mapfile -t chunk_files < <(find "$chunk_dir" -maxdepth 1 -type f -name 'server_*' | sort)
     chunk_total="${#chunk_files[@]}"
 
@@ -1708,6 +1750,7 @@ run_collect_by_jid_chunked() {
 	if [[ "${SALT_APPLY_CONTEXT:-default}" != "file_deploy" ]]; then
         printf '  SALT START : %s\n' "$(date '+%F %T')"
         printf '  분할 실행  : %s대 × 총 %s회\n' "$chunk_size" "$chunk_total"
+        printf '  분할 순서  : %s\n' "$chunk_order_label"
         echo
         printf '  진행률 확인중... poll=%ss timeout=%ss\n' "$poll_interval" "$job_wait_timeout"
 	fi
@@ -1750,7 +1793,7 @@ run_collect_by_jid_chunked() {
     done
 
 	echo
-
+	
 	if [[ "${SALT_APPLY_CONTEXT:-default}" != "file_deploy" ]]; then
         printf '  SALT END   : %s\n' "$(date '+%F %T')"
 
