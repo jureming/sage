@@ -102,6 +102,10 @@ TIMEOUT=5
 ASYNC=false
 COLLECT_BY_JID=true
 JOB_WAIT_TIMEOUT=300
+
+# JID_CHUNK_SIZE 사용 시 기본값은 랜덤 셔플입니다.
+# 정렬된 server 목록 순서대로 분할하려면 false로 설정합니다.
+# JID_CHUNK_RANDOMIZE=false
 ```
 
 SLS 실행 예시:
@@ -188,7 +192,8 @@ file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
 | `ASYNC` | `false` | `true`이면 `salt --async`로 job만 등록하고 일반 결과 수집/post를 생략합니다. JID는 `log/async_jid`에 저장합니다. |
 | `COLLECT_BY_JID` | `true` | `ASYNC=false`일 때 JID 기반으로 진행률을 확인하고 마지막에 `jobs.lookup_jid` 결과를 수집합니다. `false`이면 기존 stdout 기반 수집을 사용합니다. |
 | `ASYNC_RESULT` | `false` | `ASYNC=true + cmd.run + RUN_SCRIPT` 전용입니다. minion에서 stdout/stderr/exit code를 event로 보내고 listener가 결과를 저장합니다. |
-| `JID_CHUNK_SIZE` | 비움 | 양의 정수이면 대상 서버를 해당 개수 단위로 나눠 JID 기반 순차 실행합니다. `ASYNC=true` 또는 `COLLECT_BY_JID=false`와 같이 쓸 수 없습니다. |
+| `JID_CHUNK_SIZE` | 비움 | 양의 정수이면 대상 서버를 해당 개수 단위로 나눠 JID 기반 순차 실행합니다. 기본적으로 대상 목록을 랜덤 셔플 후 분할합니다. `ASYNC=true` 또는 `COLLECT_BY_JID=false`와 같이 쓸 수 없습니다. |
+| `JID_CHUNK_RANDOMIZE` | `true` | `JID_CHUNK_SIZE` 분할 전 대상 목록 랜덤 셔플 여부입니다. `false`이면 정렬된 최종 `server` 목록 순서대로 분할합니다. |
 | `BATCH` | 비움 | `COLLECT_BY_JID=false`인 기존 stdout 수집 모드에서 Salt `-b` batch 옵션으로 사용됩니다. |
 
 timeout/재시도 옵션:
