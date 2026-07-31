@@ -35,7 +35,7 @@ while true; do
 		--max-time 60
 		-H "Authorization: Token ${NETBOX_TOKEN}"
 		-H "Accept: application/json"
-		--data-urlencode "status!=offline"
+		--data-urlencode "status__n=offline"
 		--data-urlencode "fields=name,role,platform,primary_ip4,primary_ip6,site,cluster,custom_fields"
 		--data-urlencode "ordering=name"
 		--data-urlencode "limit=${limit}"
@@ -115,7 +115,7 @@ mv -f -- "$vm_tmp" $base_dir/vm_inventory
 				--max-time 60 \
 				-H "Authorization: Token ${NETBOX_TOKEN}" \
 				-H "Accept: application/json" \
-				--data-urlencode "status!=offline" \
+				--data-urlencode "status__n=offline" \
 				--data-urlencode "fields=name,role,platform,primary_ip4,primary_ip6,site,custom_fields" \
 				--data-urlencode "ordering=name" \
 				--data-urlencode "limit=${limit}" \
