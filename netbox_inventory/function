@@ -168,7 +168,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Sequence
 
 
 VM_FIELDS: tuple[str, ...] = (
@@ -245,7 +245,7 @@ class OrExpression:
     expressions: tuple["BooleanExpression", ...]
 
 
-BooleanExpression = Union[Condition, AndExpression, OrExpression]
+BooleanExpression = Condition | AndExpression | OrExpression
 
 
 @dataclass(frozen=True)
@@ -670,3 +670,4 @@ get_valid_mailservers() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     inventory "$@"
 fi
+
