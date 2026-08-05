@@ -1417,6 +1417,8 @@ run_user_post() {
 
     set +e
     (
+        # post 내부의 상대경로와 pwd는 항상 현재 job 디렉토리를 기준으로 한다.
+        cd "$base_dir"
         . "$post_file"
     )
     user_post_rc=$?
@@ -1994,7 +1996,12 @@ if [[ -f "$pre_file" ]]; then
 
         # 기존 make_server와 동일하게 현재 shell에서 실행한다.
         # pre에서는 config 변수와 $home_dir/$base_dir/$tmp_dir 등을 그대로 사용할 수 있다.
-        source "$pre_file"
+        # 상대경로와 pwd는 현재 job 디렉토리($base_dir)를 기준으로 동작한다.
+        __sage_pre_original_pwd="$PWD"
+        cd "$base_dir"
+         source "$pre_file"
+        cd "$__sage_pre_original_pwd"
+        unset __sage_pre_original_pwd
 
         if [[ ! -s "$base_dir/server" ]]; then
             if [[ -s "$server_backup" ]]; then
@@ -2518,4 +2525,3 @@ case "$answer" in
         exit 0
         ;;
 esac
-
