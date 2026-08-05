@@ -33,6 +33,7 @@ init_target=""
 #
 # config 로드 후 기준 경로:
 #   $base_dir/config
+#   $base_dir/pre
 #   $base_dir/local
 #   $base_dir/remote
 #   $base_dir/post
@@ -214,9 +215,10 @@ init_job_dir() {
     echo "--------------------------------------------------------------------------"
     echo "다음 파일을 작업에 맞게 수정하세요:"
     echo "  README : 작업 기본 정보(작업명/설명/작성자 등)"
-    echo "  config : 서버 목록 생성(make_server) 및 실행 옵션"
+    echo "  config : Salt 실행 옵션"
+    echo "  pre    : (선택) 실행 전 사전 작업 및 server 목록 생성"
     echo "  remote : 대상 서버에서 실행할 명령"
-    echo "  local  : (선택) Salt 실행 전 master 로컬 사전 작업"
+    echo "  local  : (선택) Salt 실행 전 master 로컬 작업"
     echo "  post   : (선택) 실행 결과 정리 후 후처리"
     echo "--------------------------------------------------------------------------"
     echo "실행 예: cd $dest_dir && sage"
@@ -296,12 +298,12 @@ config_file="$base_dir/config"
 # ============================================================
 # 작업 파일 Bash 문법 검사
 # ============================================================
-# config/local/remote/post는 Bash 기반 파일이므로
+# config/pre/local/remote/post는 Bash 기반 파일이므로
 # config source 및 server/minion 처리 전에 bash -n으로 검사한다.
 # 하나라도 문법 오류가 있으면 전체 오류를 출력한 뒤 실행을 중단한다.
 # ============================================================
 validate_job_bash_syntax() {
-    local -a check_names=("config" "local" "remote" "post")
+    local -a check_names=("config" "pre" "local" "remote" "post")
     local -a error_names=()
     local -a error_messages=()
     local name=""
@@ -315,7 +317,7 @@ validate_job_bash_syntax() {
         file="$base_dir/$name"
 
         # config는 아래에서 필수 파일 여부를 별도로 검사한다.
-        # local/remote/post는 파일이 있을 때만 문법 검사한다.
+        # pre/local/remote/post는 파일이 있을 때만 문법 검사한다.
         [[ -f "$file" ]] || continue
 
         if ! syntax_error="$(bash -n "$file" 2>&1)"; then
@@ -358,7 +360,7 @@ if [[ ! -f "$config_file" ]]; then
     exit 1
 fi
 
-# config/local/remote/post Bash 문법 검사
+# config/pre/local/remote/post Bash 문법 검사
 # 오류가 있으면 config source 전에 실행을 중단한다.
 validate_job_bash_syntax
 
@@ -659,7 +661,6 @@ case "${ASYNC:-false}" in
         exit 1
         ;;
 esac
-
 
 # ============================================================
 # COLLECT_BY_JID 옵션 검증
@@ -1948,63 +1949,65 @@ rm -f "$log_dir/server_fail" "$log_dir/log_salt"
 # 요약 출력 변수에 기본값을 설정한다.
 server_summary="기존 파일 사용"
 minion_summary="key 완료 / ping 완료"
-
+pre_status="OFF"
 # ============================================================
-# 대상 서버 목록 생성
+# 실행 전 사전 작업 및 대상 서버 목록 생성
 #
 # 우선순위
-# 1. config 안에 유효한 make_server 함수가 있으면 실행
-#    - make_server 함수는 $base_dir/server 파일을 생성해야 함
-# 2. make_server 함수가 없거나, 실제 생성 로직이 없거나, 실행 결과가 비어있으면 기존 server 파일 사용
+# 1. pre 파일에 유효한 실행 내용이 있으면 실행
+#    - pre에서 server를 생성하면 해당 결과를 사용
+# 2. pre가 없거나, 실제 실행 내용이 없거나, 실행 결과 server가 비어있으면 기존 server 파일 사용
 # 3. 기존 server 파일도 없거나 비어있으면 종료
 # ============================================================
 
-server_backup="$tmp_dir/server_before_make"
+pre_file="$base_dir/pre"
+server_backup="$tmp_dir/server_before_pre"
 
-# make_server 실행 전에 기존 server 파일 백업
+# pre 실행 전에 기존 server 파일 백업
 if [[ -s "$base_dir/server" ]]; then
     cp -f "$base_dir/server" "$server_backup"
 else
     > "$server_backup"
 fi
 
-if declare -F make_server >/dev/null; then
-    make_server_effective="$tmp_dir/make_server_effective"
+if [[ -f "$pre_file" ]]; then
+    pre_effective="$tmp_dir/pre_effective"
 
-    declare -f make_server | awk '
-        /^[[:space:]]*make_server[[:space:]]*\(\)[[:space:]]*$/ { next }
-        /^[[:space:]]*make_server[[:space:]]*\(\)[[:space:]]*\{[[:space:]]*$/ { next }
-        /^[[:space:]]*\{[[:space:]]*$/ { next }
-        /^[[:space:]]*\}[[:space:]]*$/ { next }
-        /^[[:space:]]*#/ { next }
+    awk '
+        /^[[:space:]]*#!/ { next }
+       /^[[:space:]]*#/ { next }
         /^[[:space:]]*$/ { next }
 
-        /^[[:space:]]*\.[[:space:]]+"?\$home_dir\/common\/function"?[[:space:]]*$/ { next }
-        /^[[:space:]]*source[[:space:]]+"?\$home_dir\/common\/function"?[[:space:]]*$/ { next }
+        /^[[:space:]]*\.[[:space:]]+"?\$home_dir\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
+        /^[[:space:]]*source[[:space:]]+"?\$home_dir\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
 
-        /^[[:space:]]*\.[[:space:]]+"?\$\{home_dir\}\/common\/function"?[[:space:]]*$/ { next }
-        /^[[:space:]]*source[[:space:]]+"?\$\{home_dir\}\/common\/function"?[[:space:]]*$/ { next }
+        /^[[:space:]]*\.[[:space:]]+"?\$\{home_dir\}\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
+        /^[[:space:]]*source[[:space:]]+"?\$\{home_dir\}\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
 
         { print }
-    ' > "$make_server_effective"
+    ' "$pre_file" > "$pre_effective"
 
-    if [[ -s "$make_server_effective" ]]; then
-        # make_server 결과가 실제로 있는지 확인하기 위해 기존 server는 비우고 실행
-        > "$base_dir/server"
+    if [[ -s "$pre_effective" ]]; then
+        pre_status="ON"
+      # pre가 server를 새로 생성하는지 확인하기 위해 기존 server는 비우고 실행
+      > "$base_dir/server"
 
-        make_server
+        # 기존 make_server와 동일하게 현재 shell에서 실행한다.
+        # pre에서는 config 변수와 $home_dir/$base_dir/$tmp_dir 등을 그대로 사용할 수 있다.
+        source "$pre_file"
+
         if [[ ! -s "$base_dir/server" ]]; then
             if [[ -s "$server_backup" ]]; then
                 cp -f "$server_backup" "$base_dir/server"
-				server_summary="기존 파일 사용"
-            else
-				echo "make_server 실행 결과 server 파일이 없거나 비어있습니다."
-				echo "확인 경로: $base_dir/server"
-                exit 1
+                server_summary="기존 파일 사용"
+          else
+                echo "pre 실행 결과 server 파일이 없거나 비어있습니다."
+                echo "확인 경로: $base_dir/server"
+              exit 1
             fi
         else
-            server_summary="config make_server 사용"
-        fi
+            server_summary="pre 사용"
+      fi
     else
         if [[ ! -s "$base_dir/server" ]]; then
             echo "⏹       $base_dir/server 파일이 없거나 비어있습니다."
@@ -2351,6 +2354,7 @@ sage_print_section "sage 실행 정보"
 printf '  server : %s\n' "${server_summary:-기존 파일 사용}"
 printf '  minion : %s\n' "${minion_summary:-key 완료 / ping 완료}"
 echo
+printf '  %-13s : %s\n' "pre" "$pre_status"
 printf '  %-13s : %s\n' "local" "$local_status"
 printf '  %-13s : %s\n' "$salt_execution_name" "ON"
 printf '  %-13s : %s\n' "post" "$post_status"
@@ -2514,3 +2518,4 @@ case "$answer" in
         exit 0
         ;;
 esac
+
