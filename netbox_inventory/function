@@ -168,7 +168,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Union
 
 
 VM_FIELDS: tuple[str, ...] = (
@@ -245,7 +245,7 @@ class OrExpression:
     expressions: tuple["BooleanExpression", ...]
 
 
-BooleanExpression = Condition | AndExpression | OrExpression
+BooleanExpression = Union[Condition, AndExpression, OrExpression]
 
 
 @dataclass(frozen=True)
