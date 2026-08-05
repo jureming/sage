@@ -1,34 +1,5 @@
-# ============================================================
-# 서버 목록 생성
-# ============================================================
-# start.sh에서 make_server 함수를 호출함
-#
-# 이 함수는 반드시 아래 파일을 생성해야 함:
-#   $base_dir/server
-#
-# server에는 실행 후보 서버 목록을 한 줄에 하나씩 저장
-#
-# 이후 start.sh에서 아래 순서로 필터링함:
-#   1. salt-key accepted 여부 확인
-#   2. test.ping 응답 여부 확인
-#   3. 최종 실행 대상은 $base_dir/server 로 저장
-#   4. 제외 대상은 $base_dir/log/server_fail 으로 저장
-# ============================================================
-make_server() {
-    . "$home_dir/common/function"
-
-    # 서버 목록 생성 예시
-    # 서버목록_조회_명령어 | awk '{print $1}' | sort -u > "$base_dir/server"
-
-    # 직접 서버 목록을 작성하는 예시
-    #cat << 'EOF' > "$base_dir/server"
-    #대상서버1
-    #대상서버2
-    #대상서버3
-    #EOF
-}
 # ------------------------------------------------------------
-# 2) cmd.run
+# 1) cmd.run
 # ------------------------------------------------------------
 # RUN_SCRIPT 파일 내용을 대상 서버에서 실행
 #
@@ -70,15 +41,27 @@ RUN_SCRIPT="$base_dir/remote"
 # JID_CHUNK_SIZE
 #         : 최종 server 목록을 지정한 개수만큼 나눠
 #           salt --async + jobs.lookup_jid 방식으로 순차 실행합니다.
+#           기본적으로 최종 server 목록을 랜덤 셔플한 뒤 분할합니다.
 #           비어있거나 0이면 기존처럼 전체 대상을 한 번에 실행합니다.
 #           ASYNC=true 또는 COLLECT_BY_JID=false 와는 함께 사용할 수 없습니다.
 #
 #           예) JID_CHUNK_SIZE="200"
 #               - 대상 1500대면 200대씩 총 8회 실행
-#			    JID_CHUNK_SIZE="" or JID_CHUNK_SIZE="0"
-#			    - 사용안함
+#               JID_CHUNK_SIZE="" or JID_CHUNK_SIZE="0"
+#               - 사용안함
+#
+# JID_CHUNK_RANDOMIZE
+#         : JID_CHUNK_SIZE 분할 전 대상 목록 랜덤 셔플 여부
+#           true/false, 기본값 true
+#           false이면 정렬된 최종 server 목록 순서대로 분할합니다.
 # ============================================================
 SKIP_PING="true"
 ASYNC="false"
 COLLECT_BY_JID="true"
 JOB_WAIT_TIMEOUT="300"
+
+
+# ============================================================
+make_server() {
+    bash $base_dir/pre
+}
