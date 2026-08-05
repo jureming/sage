@@ -42,8 +42,8 @@ inventory_help() {
   get_vm_allservers          VM 전체 서버명
   get_device_allservers      Device 전체 서버명
   get_mailservers            service_unit=webmail_SVC 전체 메일 서버
-  get_valid_s_mailservers    단독 메일 서버
-  get_valid_d_mailservers    통합 메일 서버
+  get_valid_s_mailservers    통합 메일 서버
+  get_valid_d_mailservers    단독 메일 서버
   get_valid_resellers        리셀러 전용 통합 메일 서버
   get_valid_mailservers      deploy_exception=false인 전체 메일 서버
 
@@ -649,7 +649,7 @@ get_mailservers() {
 }
 
 get_valid_s_mailservers() {
-    inventory "select distinct name from vm where service_unit='webmail_SVC' and name regexp '^m[0-9]$' and deploy_exception='false'"
+    inventory "select distinct name from vm where service_unit='webmail_SVC' and name regexp '^m[0-9]+$' and deploy_exception='false'"
 }
 
 get_valid_d_mailservers() {
@@ -670,4 +670,3 @@ get_valid_mailservers() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     inventory "$@"
 fi
-
