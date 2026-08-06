@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
 
-# ============================================================
-# 사용자 pre 스크립트
-# ============================================================
-# 이 파일은 config 로드 후, 실행 대상 서버를 확정하기 전에
-# master 로컬에서 실행되는 사전 작업 스크립트입니다.
-# 주석이나 공백만 있을 경우 실행되지 않습니다.
-# ============================================================
+. /data/salt/common/netbox_inventory/function
 
-# ============================================================
-# server 파일 생성
-# ============================================================
-# NetBox inventory 공통 함수 사용 예시
-# inventory "select name from vm where zone = 'test-corp' and deploy_exception = 'false'" > $base_dir/server
-# ============================================================
-. "$home_dir/common/netbox_inventory/function"
-base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# server 파일이 없으면 최초 실행 안내를 위해 inventory 사용 설명을 출력한다.
+if [ ! -f "$base_dir/server" ]; then
+    inventory -h
+fi
