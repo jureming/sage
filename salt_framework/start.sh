@@ -1997,14 +1997,13 @@ if [[ -f "$pre_file" ]]; then
       # pre가 server를 새로 생성하는지 확인하기 위해 기존 server는 비우고 실행
       > "$base_dir/server"
 
-        # 기존 make_server와 동일하게 현재 shell에서 실행한다.
-        # pre에서는 config 변수와 $home_dir/$base_dir/$tmp_dir 등을 그대로 사용할 수 있다.
+        # pre는 별도 서브셸에서 실행한다.
         # 상대경로와 pwd는 현재 job 디렉토리($base_dir)를 기준으로 동작한다.
-        __sage_pre_original_pwd="$PWD"
-        cd "$base_dir"
-         source "$pre_file"
-        cd "$__sage_pre_original_pwd"
-        unset __sage_pre_original_pwd
+        # pre에서 변경한 변수, 함수, 작업 디렉토리는 Sage 본체에 영향을 주지 않는다.
+        (
+            cd "$base_dir"
+            . "$pre_file"
+        )
 
         if [[ ! -s "$base_dir/server" ]]; then
             if [[ -s "$server_backup" ]]; then
