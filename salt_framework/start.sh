@@ -1986,6 +1986,9 @@ if [[ -f "$pre_file" ]]; then
         /^[[:space:]]*\.[[:space:]]+"?\$\{home_dir\}\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
         /^[[:space:]]*source[[:space:]]+"?\$\{home_dir\}\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
 
+        /^[[:space:]]*\.[[:space:]]+"?\/data\/salt\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
+        /^[[:space:]]*source[[:space:]]+"?\/data\/salt\/common\/netbox_inventory\/function"?[[:space:]]*$/ { next }
+
         { print }
     ' "$pre_file" > "$pre_effective"
 
