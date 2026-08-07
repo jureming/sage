@@ -1,6 +1,6 @@
 # sage
 
-`sage`는 `/data/salt` 아래 작업 디렉토리의 `config`, `server`, `remote`, `local`, `post` 파일을 기준으로 Salt 작업을 실행하고 결과를 `result/`, `error/`, `log/`에 정리하는 Bash 기반 실행 래퍼입니다.
+`sage`는 `/data/salt` 아래 작업 디렉토리의 `config`, `pre`, `server`, `remote`, `local`, `post` 파일을 기준으로 Salt 작업을 실행하고 결과를 `result/`, `error/`, `log/`에 정리하는 Bash 기반 실행 래퍼입니다.
 
 ## 구성 파일
 
@@ -21,12 +21,14 @@
 /data/salt/common/sample/
   README
   config
+  pre
   local
   remote
   post
 
 /data/salt/manual/<분류>/<작업명>/
   config
+  pre
   server
   remote
   local
@@ -82,12 +84,15 @@ CLI 옵션:
 | 파일 | 필수 | 설명 |
 | --- | --- | --- |
 | `config` | 예 | Salt 실행 설정을 Bash 변수로 정의합니다. |
-| `server` | 조건부 | 실행 대상 서버 목록입니다. `make_server`가 `server`를 생성하면 없어도 됩니다. |
+| `pre` | 아니오 | `config` 로드 후, 대상 서버 확정 전에 master 로컬에서 실행할 사전 스크립트입니다. `server` 파일을 동적으로 생성할 때 사용합니다. |
+| `server` | 조건부 | 실행 대상 서버 목록입니다. `pre`가 `server`를 생성하면 없어도 됩니다. |
 | `remote` | 조건부 | `cmd.run + RUN_SCRIPT` 모드에서 대상 서버에서 실행할 스크립트입니다. |
 | `local` | 아니오 | Salt 실행 전에 master 로컬에서 실행할 스크립트입니다. 주석/공백만 있으면 무시합니다. `file_deploy` 함수를 사용할 수 있습니다. |
 | `post` | 아니오 | 결과 생성 후 master 로컬에서 실행할 후처리 스크립트입니다. 주석/공백만 있으면 무시합니다. |
 
 `server` 파일은 한 줄에 host 하나를 권장합니다. 빈 줄과 `#` 주석은 일부 처리에서 무시됩니다.
+
+`pre`는 별도 서브셸에서 실행되며, 상대경로와 `pwd`는 현재 작업 디렉토리(`$base_dir`) 기준으로 동작합니다. `pre`에서 변경한 변수, 함수, 작업 디렉토리는 Sage 본체에 영향을 주지 않습니다.
 
 ## config 예시
 
@@ -103,7 +108,8 @@ ASYNC=false
 COLLECT_BY_JID=true
 JOB_WAIT_TIMEOUT=300
 
-# JID_CHUNK_SIZE 사용 시 기본값은 랜덤 셔플입니다.
+# JID_CHUNK_SIZE는 미설정 시 대상이 200대 초과하면 200이 자동 적용됩니다.
+# 사용 시 기본값은 랜덤 셔플입니다.
 # 정렬된 server 목록 순서대로 분할하려면 false로 설정합니다.
 # JID_CHUNK_RANDOMIZE=false
 ```
@@ -128,12 +134,14 @@ SALT_ARGS=(
 )
 ```
 
-대상 서버를 config에서 생성:
+대상 서버를 pre에서 생성:
 
 ```bash
-make_server() {
-    printf '%s\n' m10 m11 m12 > "$base_dir/server"
-}
+#!/usr/bin/env bash
+
+. /data/salt/common/netbox_inventory/function
+
+inventory "select name from vm where zone = 'test-corp' and deploy_exception = 'false'" > "$base_dir/server"
 ```
 
 ## local file_deploy
@@ -141,8 +149,8 @@ make_server() {
 `local` 파일 안에서는 `file_deploy`로 파일을 전체 대상 서버에 배포할 수 있습니다. 내부적으로 Salt `state.single file.managed`를 사용하며, 배포 실패는 `error/<host>`에 `deploy fail : <파일명>` 형식으로 기록합니다.
 
 ```bash
-file_deploy "$base_dir/files/app.tar.gz" "/home/"
-file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
+file_deploy $base_dir/files/app.tar.gz /home/
+file_deploy $base_dir/files/app.conf /etc/app/app.conf
 ```
 
 동작 기준:
@@ -150,6 +158,7 @@ file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
 - `local` 실행 중에만 사용할 수 있습니다.
 - 대상 경로는 절대경로여야 합니다.
 - 대상 경로가 `/`로 끝나면 원본 파일명을 유지합니다.
+- 대상 경로에 `/.` 형태를 사용하면 정상 처리되지 않으므로 `/home/`처럼 디렉토리 경로를 그대로 지정해야 합니다.
 - 배포용 source는 `/data/salt/apply/sage_file_deploy/<run_id>/` 아래에 임시 staging 후 종료 시 삭제합니다.
 - 같은 파일시스템이면 hard link를 사용하고, 불가능하면 `cp -p`로 복사합니다.
 - 배포 실패가 있어도 `server` 목록은 유지하고 이후 remote/Salt 실행은 계속 진행합니다.
@@ -180,7 +189,7 @@ file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
 
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
-| `make_server()` | 없음 | 정의되어 있고 실제 로직이 있으면 실행 전에 `$base_dir/server`를 생성합니다. 결과가 비면 기존 `server`를 사용합니다. |
+| `pre` | 없음 | `$base_dir/pre` 파일에 유효한 실행 내용이 있으면 실행 전에 별도 서브셸에서 실행합니다. 결과로 `$base_dir/server`가 생성되면 해당 목록을 사용하고, 비어 있으면 실행 전 기존 `server`를 사용합니다. |
 | `SKIP_PING` | `false` | `true`이면 `test.ping` 검사를 생략하고 accepted key cache에 있는 서버를 실행 대상으로 사용합니다. |
 | `DIRTY_NODES_FILE` | `/data/salt/common/dirty_nodes` | 실행에서 제외할 host 목록 파일입니다. 제외 사유는 `log/server_fail`에 `dirty_nodes`로 기록됩니다. |
 | `KEY_FILE` | `$framework_dir/__cache__/accepted_nodes` | accepted key 목록 cache 파일입니다. `start.sh`는 `salt-key`를 직접 조회하지 않고 이 파일을 기준으로 등록 여부를 확인합니다. |
@@ -192,7 +201,7 @@ file_deploy "$base_dir/files/app.conf" "/etc/app/app.conf"
 | `ASYNC` | `false` | `true`이면 `salt --async`로 job만 등록하고 일반 결과 수집/post를 생략합니다. JID는 `log/async_jid`에 저장합니다. |
 | `COLLECT_BY_JID` | `true` | `ASYNC=false`일 때 JID 기반으로 진행률을 확인하고 마지막에 `jobs.lookup_jid` 결과를 수집합니다. `false`이면 기존 stdout 기반 수집을 사용합니다. |
 | `ASYNC_RESULT` | `false` | `ASYNC=true + cmd.run + RUN_SCRIPT` 전용입니다. minion에서 stdout/stderr/exit code를 event로 보내고 listener가 결과를 저장합니다. |
-| `JID_CHUNK_SIZE` | 비움 | 양의 정수이면 대상 서버를 해당 개수 단위로 나눠 JID 기반 순차 실행합니다. 기본적으로 대상 목록을 랜덤 셔플 후 분할합니다. `ASYNC=true` 또는 `COLLECT_BY_JID=false`와 같이 쓸 수 없습니다. |
+| `JID_CHUNK_SIZE` | 미설정 | 미설정이면 대상이 200대 초과할 때 200이 자동 적용됩니다. 빈 값/0이면 자동 분할을 해제하고, 양의 정수이면 해당 개수 단위로 JID 기반 순차 실행합니다. `ASYNC=true` 또는 `COLLECT_BY_JID=false`와 같이 쓸 수 없습니다. |
 | `JID_CHUNK_RANDOMIZE` | `true` | `JID_CHUNK_SIZE` 분할 전 대상 목록 랜덤 셔플 여부입니다. `false`이면 정렬된 최종 `server` 목록 순서대로 분할합니다. |
 | `BATCH` | 비움 | `COLLECT_BY_JID=false`인 기존 stdout 수집 모드에서 Salt `-b` batch 옵션으로 사용됩니다. |
 
@@ -280,31 +289,33 @@ bash /data/salt/common/netbox_inventory/accepted_nodes_sync.sh
 
 `accepted_nodes_sync.sh`는 `salt-key -l accepted` 조회 결과를 `/data/salt/common/salt_framework/__cache__/accepted_nodes`에 저장합니다. `start.sh`는 실행 때마다 `salt-key`를 직접 호출하지 않고 이 cache 파일로 accepted minion 여부를 확인합니다. cache 파일이 없거나 비어 있으면 실행을 중단합니다.
 
-`function` 파일은 `config`에서 source 해서 사용할 수 있습니다.
+`function` 파일은 `pre`에서 source 해서 사용할 수 있습니다.
 
 ```bash
-make_server() {
-    . /data/salt/common/netbox_inventory/function
-    get_allservers > "$base_dir/server"
-}
+. /data/salt/common/netbox_inventory/function
+
+# SQL-like 직접 조회
+inventory "select name from vm where zone = 'test-corp' and deploy_exception = 'false'" > "$base_dir/server"
+
+# 고정 함수 사용
+get_allservers > "$base_dir/server"
+get_valid_s_mailservers > "$base_dir/server"
+get_valid_d_mailservers > "$base_dir/server"
+get_valid_mailservers > "$base_dir/server"
 ```
 
 주요 함수:
 
 | 함수 | 설명 |
 | --- | --- |
-| `get_allservers` | 현재 salt-master Zone 기준 전체 서버입니다. `salt01`, `salt02`에서는 Device 서버도 포함합니다. |
-| `get_vm_allservers` | 현재 salt-master Zone 기준 VM 서버입니다. |
+| `get_allservers` | VM + Device 전체 서버입니다. |
+| `get_vm_allservers` | VM 전체 서버입니다. |
 | `get_device_allservers` | 전체 Device 서버입니다. |
-| `get_real_allservers` | Zone 구분 없는 전체 VM/Device 서버입니다. |
-| `get_mailservers` | 전체 메일 서버입니다. |
-| `get_valid_d_mailservers` | 단독 메일 서버입니다. |
+| `get_mailservers` | `service_unit=webmail_SVC` 전체 메일 서버입니다. |
 | `get_valid_s_mailservers` | 통합 메일 서버입니다. |
-| `get_valid_resellers` | 리셀러 전용 메일 서버입니다. |
-| `get_non_mailservers` | 현재 Zone 전체 서버 중 메일 서버를 제외한 목록입니다. |
-| `get_os_servers "<OS>"` | OS 기준 서버입니다. |
-| `get_service_unit_servers "<Service-unit>"` | Service-unit 기준 서버입니다. |
-| `get_role_servers "<Role>"` | Role 기준 서버입니다. |
+| `get_valid_d_mailservers` | 단독 메일 서버입니다. |
+| `get_valid_resellers` | 리셀러 전용 통합 메일 서버입니다. |
+| `get_valid_mailservers` | `deploy_exception=false`인 전체 메일 서버입니다. |
 
 ## 의존 명령
 
@@ -317,7 +328,7 @@ make_server() {
 
 ## 주의사항
 
-- `config`는 Bash로 `source`됩니다. 신뢰 가능한 작업 디렉토리에서만 사용하세요.
+- `config`, `pre`, `local`, `post`는 Bash로 실행됩니다. 신뢰 가능한 작업 디렉토리에서만 사용하세요.
 - `base_dir`, `home_dir`, `apply_dir`은 `start.sh`가 다시 고정합니다. config에서 같은 이름을 선언해도 실행 기준은 `start.sh`가 결정한 값입니다.
 - accepted key 목록은 `salt_framework/__cache__/accepted_nodes` cache 파일 기준입니다. 최신화는 `netbox_inventory/accepted_nodes_sync.sh` 또는 `refresh_inventory.sh`로 수행합니다.
 - `ASYNC=true` 단독 모드는 job만 등록하고 `result/`, `error/`, `post` 처리를 하지 않습니다.
