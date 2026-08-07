@@ -41,7 +41,6 @@ init_target=""
 #   $framework_dir/salt_apply
 #   $base_dir/log/server_fail
 #   $base_dir/log/log_salt
-#   $base_dir/log/async_jid
 #   $base_dir/log/debug.log
 #   $base_dir/.tmp/result_status
 #   $base_dir/result/*
@@ -608,7 +607,7 @@ DEBUG_MODE="${DEBUG_MODE:-false}"
 DEBUG_PRINT="${DEBUG_PRINT:-false}"
 
 # 실행 산출물 로그 디렉토리
-# async_jid, debug.log, log_salt, server_fail 은 모두 이 디렉토리에 저장한다.
+# jid_registry, debug.log, log_salt, server_fail 은 모두 이 디렉토리에 저장한다.
 log_dir="${log_dir:-$base_dir/log}"
 DEBUG_LOG="${DEBUG_LOG:-$log_dir/debug.log}"
 
@@ -839,9 +838,6 @@ file_deploy_stage_root="$apply_dir/sage_file_deploy/$sage_file_deploy_run_id"
 
 # ============================================================
 # Sage 실행 단위 JID registry
-#
-# async_jid:
-#   기존 화면 출력 및 sage_history 메인/청크 기록용
 #
 # jid_registry:
 #   현재 Sage 실행에서 생성된 모든 Salt JID 추적용
@@ -2023,87 +2019,32 @@ append_sage_jid_history() {
 }
 
 # ============================================================
-# sage Salt 실행 히스토리 기록
+# sage Salt 실행 히스토리 최종 요약
 # ============================================================
-# salt_apply 실행 후 전역 히스토리 로그를 남긴다.
+# 각 JID 상세 이력은 salt_apply에서 해당 JID 처리 완료 직후
+# append_sage_jid_history()로 즉시 기록한다.
 #
-# 기록 위치:
-#   /var/log/salt/sage_history.log
-#
-# 일반 실행:
-#   날짜시간    JOB: 작업경로    JID: Salt_JID    SALT_RC: 결과코드
-#
-# JID_CHUNK_SIZE 실행:
-#   - 청크별 JID, 대상 수, 결과코드 기록
-#   - 마지막에 전체 청크 완료 요약 기록
-#
-# 주의:
-#   - Bash 문법 검사 실패, 실행 전 검증 실패, 사용자 취소는 기록하지 않는다.
-#   - 히스토리 기록 실패가 Salt 작업 실패로 이어지지 않도록 오류를 무시한다.
-#   - async_jid 파일이 없으면 JID는 no_jid로 기록한다.
+# 이 함수는 메인 JID 청크 실행의 최종 SUMMARY만 기록한다.
+# 일반 실행과 file_deploy 상세 JID는 여기서 재기록하지 않는다.
 # ============================================================
 write_sage_history() {
     local history_dir="/var/log/salt"
     local history_log="$history_dir/sage_history.log"
-    local history_jid="no_jid"
     local history_rc="${SALT_RC:-unknown}"
-    local chunk_label=""
-    local chunk_jid=""
-    local chunk_targets=""
-    local chunk_rc=""
-    local chunk_total=""
-    local chunk_done=""
+
+    [[ "${SAGE_JID_CHUNK_USED:-0}" -eq 1 ]] || return 0
 
     {
         mkdir -p "$history_dir"
 
-        # ----------------------------------------------------
-        # 기존 메인/청크 JID 이력
-        # 기존 async_jid 포맷과 기록 방식은 그대로 유지한다.
-        # ----------------------------------------------------
-        if [[ -s "$log_dir/async_jid" ]] && grep -Eq '^[0-9]+/[0-9]+[[:space:]]+' "$log_dir/async_jid"; then
-            while IFS=$'\t' read -r chunk_label chunk_jid chunk_targets chunk_rc; do
-                [[ -z "${chunk_label:-}" ]] && continue
-                [[ -z "${chunk_jid:-}" ]] && continue
-                [[ -z "${chunk_targets:-}" ]] && chunk_targets="unknown"
-                [[ -z "${chunk_rc:-}" ]] && chunk_rc="$history_rc"
-
-				append_sage_jid_history \
-			    "$chunk_jid" \
-			    "chunk" \
-			    "$chunk_label" \
-			    "$chunk_targets" \
-			    "$chunk_rc"
-	 
-            done < "$log_dir/async_jid"
-
-            chunk_total="$(awk -F '[\t/]' 'NF >= 2 {value = $2} END {print value}' "$log_dir/async_jid")"
-            chunk_done="$(awk -F '[\t/]' 'NF >= 2 {value = $1} END {print value}' "$log_dir/async_jid")"
-
-            [[ -z "$chunk_total" ]] && chunk_total="unknown"
-            [[ -z "$chunk_done" ]] && chunk_done="unknown"
-
-	        printf '%s\tJOB: %s\tTYPE: JID_CHUNK_SUMMARY\tLABEL: %s/%s\tJID: -\tTARGETS: %s\tSALT_RC: %s\n' \
-			    "$(date '+%F %T')" \
-			    "${SAGE_JOB_DIR:-$base_dir}" \
-			    "$chunk_done" \
-			    "$chunk_total" \
-			    "${server_count:-unknown}" \
-			    "$history_rc" \
-			    >> "$history_log"
-		else
-            if [[ -s "$log_dir/async_jid" ]]; then
-                history_jid="$(head -n 1 "$log_dir/async_jid" | tr -d '\r\n')"
-            fi
-				
-				append_sage_jid_history \
-				    "$history_jid" \
-				    "main" \
-				    "-" \
-				    "${server_count:-unknown}" \
-				    "$history_rc"
-
-        fi
+        printf '%s\tJOB: %s\tTYPE: JID_CHUNK_SUMMARY\tLABEL: %s/%s\tJID: -\tTARGETS: %s\tSALT_RC: %s\n' \
+            "$(date '+%F %T')" \
+            "${SAGE_JOB_DIR:-$base_dir}" \
+            "${SAGE_JID_CHUNK_DONE:-unknown}" \
+            "${SAGE_JID_CHUNK_TOTAL:-unknown}" \
+            "${SAGE_JID_CHUNK_TOTAL_TARGETS:-${server_count:-unknown}}" \
+            "$history_rc" \
+            >> "$history_log"
     } 2>/dev/null || true
 }
 
@@ -2653,7 +2594,7 @@ case "$answer" in
         . "$framework_dir/salt_apply"
 
         # sage 실행 히스토리 기록
-        # salt_apply 실행 후 SALT_RC와 async_jid가 결정된 뒤 기록한다.
+        # salt_apply 실행 후 메인 JID 청크 SUMMARY가 필요하면 기록한다.
         write_sage_history
 
         if [[ "${SALT_RC:-1}" -ne 0 ]]; then
@@ -2671,11 +2612,9 @@ case "$answer" in
 
                 if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
                     echo "  결과 수집 : event listener"
-                elif [[ -s "$log_dir/async_jid" ]]; then
-                    async_jid_value="$(head -n 1 "$log_dir/async_jid")"
-                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"
+				elif [[ -n "${SAGE_LAST_JID:-}" ]]; then
+				    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$SAGE_LAST_JID"
 				fi
-
                 echo
                 sage_print_line
                 exit 0
