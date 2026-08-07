@@ -837,6 +837,26 @@ fi
 sage_file_deploy_run_id="$(date '+%Y%m%d%H%M%S')_$$"
 file_deploy_stage_root="$apply_dir/sage_file_deploy/$sage_file_deploy_run_id"
 
+# ============================================================
+# Sage 실행 단위 JID registry
+#
+# async_jid:
+#   기존 화면 출력 및 sage_history 메인/청크 기록용
+#
+# jid_registry:
+#   현재 Sage 실행에서 생성된 모든 Salt JID 추적용
+#   main, chunk, file_deploy JID를 모두 기록한다.
+# ============================================================
+SAGE_RUN_ID="$sage_file_deploy_run_id"
+JID_REGISTRY_FILE="$log_dir/jid_registry"
+JID_REGISTRY_LOCK_FILE="$tmp_dir/jid_registry.lock"
+
+: > "$JID_REGISTRY_FILE"
+
+export SAGE_RUN_ID
+export JID_REGISTRY_FILE
+export JID_REGISTRY_LOCK_FILE
+
 cleanup() {
     if [[ "$KEEP_TMP" -eq 1 ]]; then
         echo "[DEBUG] tmp 유지: $tmp_dir"
@@ -1051,7 +1071,7 @@ run_post() {
 
 	# start.sh 시작 단계에서 이미 이전 실행 결과를 초기화한다.
 	# local의 file_deploy가 먼저 만든 error/<host>를 유지해야 하므로
-	# 여기서는 result/error를 다시 삭제하지 않고 디렉토리만 보장한다. 
+	# 여기서는 result/error를 다시 삭제하지 않고 디렉토리만 보장한다.
 	mkdir -p "$result_dir" "$error_dir"
 
     # ============================================================
@@ -1062,7 +1082,7 @@ run_post() {
     #
 	# 결과 저장 정책:
 	#   result/<host>
-	#     - 정상 결과의 stdout 저장 
+	#     - 정상 결과의 stdout 저장
 	#     - 정상 결과에 stdout이 없으면 빈 파일 생성
 	#
 	#   error/<host>
@@ -1072,7 +1092,7 @@ run_post() {
 	#     - state 실패 시 stderr가 없으면 실패 comment 저장
 	#     - state 실패 시 stderr/comment가 모두 없으면 no_stderr 저장
 	#
-	#   성공 상태의 comment는 저장하지 않는다. 
+	#   성공 상태의 comment는 저장하지 않는다.
 	# ============================================================
     python3 - "$log" "$server_file" "$result_dir" "$error_dir" <<'PY'
 import json
@@ -1349,7 +1369,7 @@ PY
 				continue
 			fi
 
-			append_error_content "$host" "$status"	
+			append_error_content "$host" "$status"
 		done < "$result_status"
     fi
 
@@ -1369,20 +1389,20 @@ PY
 		if [[ -s "$returned_hosts_file" ]] && grep -Fxq "$host" "$returned_hosts_file"; then
 		    continue
 		fi
-		
+
 		# result_status에 이미 분류된 host면 해당 상태를 사용한다.
 		if [[ -s "$result_status" ]] && awk -F '\t' -v target="$host" '$1 == target {found=1} END {exit !found}' "$result_status"; then
 		    continue
 		fi
-		
+
 		# file_deploy error가 이미 있어도 remote no_return은 뒤에 추가한다.
 		if [[ ! -f "$result_dir/$host" ]]; then
 		    append_error_content "$host" "no_return"
-		fi	
+		fi
 	done < "$server_file"
-	
+
 	RESULT_FILE_COUNT="$(find "$result_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-	ERROR_FILE_COUNT="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"	
+	ERROR_FILE_COUNT="$(find "$error_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
 }
 # ============================================================
 # 사용자 post 스크립트 사용 여부 확인
@@ -1579,6 +1599,7 @@ file_deploy() {
     local source_name=""
     local destination_file=""
     local file_size=0
+    local deploy_default_chunk_size=0
     local deploy_chunk_size=0
     local deploy_target_count=0
     local deploy_chunk_count=0
@@ -1654,8 +1675,28 @@ file_deploy() {
         return 1
     fi
 
-    deploy_chunk_size="$(__sage_file_deploy_chunk_size "$file_size")"
+    # 파일 크기에 따른 file_deploy 안전 분할 기준
+    deploy_default_chunk_size="$(__sage_file_deploy_chunk_size "$file_size")"
 
+    # 기본값은 파일 크기에 따른 안전 분할 기준
+    deploy_chunk_size="$deploy_default_chunk_size"
+
+    # config에 JID_CHUNK_SIZE를 직접 지정한 경우 비교한다.
+    #
+    # config 값이 안전 기준보다 작으면 config 값을 사용하고,
+    # 안전 기준보다 크면 안전 기준으로 제한한다.
+    if [[ "${jid_chunk_size_declared:-0}" -eq 1 && -n "${JID_CHUNK_SIZE:-}" ]]; then
+        if (( JID_CHUNK_SIZE < deploy_default_chunk_size )); then
+            deploy_chunk_size="$JID_CHUNK_SIZE"
+        elif (( JID_CHUNK_SIZE > deploy_default_chunk_size )); then
+            printf '  안내: config의 JID_CHUNK_SIZE=%s는 file_deploy 안전 기준=%s보다 커서 %s로 제한합니다.\n' \
+                "$JID_CHUNK_SIZE" \
+                "$deploy_default_chunk_size" \
+                "$deploy_default_chunk_size"
+        fi
+    fi
+
+    # 실제 대상 수보다 분할 단위가 크면 대상 수로 제한한다.
     if (( deploy_chunk_size > deploy_target_count )); then
         deploy_chunk_size="$deploy_target_count"
     fi
@@ -1769,6 +1810,11 @@ file_deploy() {
         export DEBUG_PRINT="${DEBUG_PRINT:-false}"
         export DEBUG_LOG="$deploy_work_dir/log/debug.log"
         export SALT_APPLY_CONTEXT=file_deploy
+        export SAGE_JOB_DIR
+        export SAGE_FILE_DEPLOY_LABEL="$deploy_call_label"
+        export SAGE_RUN_ID
+        export JID_REGISTRY_FILE
+        export JID_REGISTRY_LOCK_FILE
 
         SALT_FUNCTION="state.single"
         SALT_ARGS=(
@@ -1813,13 +1859,14 @@ file_deploy() {
 	sage_print_subsection "file_deploy 결과"
 	printf '    대상 파일 : %s\n' "$source_name"
 	printf '    성공/실패 : %s / %s\n' "$success_count" "$fail_count"
+	echo
 
 	if (( fail_count > 0 )); then
     	echo
     	echo "    실패 서버"
     	printf '      %s\n' "$fail_list"
 	fi
-	
+
     # 배포 실패는 error/<host>에 기록하되 기존 Mage 방식처럼
     # server 목록은 변경하지 않고 이후 local/remote를 계속 실행한다.
     # 원본/인자/staging 오류만 위에서 return 1로 처리한다.
@@ -1858,6 +1905,124 @@ run_user_local() {
 }
 
 # ============================================================
+# Salt JID 발급 시각 변환
+#
+# Salt JID 앞 14자리:
+#   YYYYMMDDHHMMSS
+#
+# 현재 환경의 Salt JID는 UTC 기준으로 생성되므로
+# Asia/Seoul 시각으로 변환해 반환한다.
+# ============================================================
+__sage_jid_history_time() {
+    local jid="${1:-}"
+    local jid_utc=""
+
+    if [[ "$jid" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
+        jid_utc="$(
+            printf '%s-%s-%s %s:%s:%s UTC' \
+                "${BASH_REMATCH[1]}" \
+                "${BASH_REMATCH[2]}" \
+                "${BASH_REMATCH[3]}" \
+                "${BASH_REMATCH[4]}" \
+                "${BASH_REMATCH[5]}" \
+                "${BASH_REMATCH[6]}"
+        )"
+
+        TZ=Asia/Seoul date -d "$jid_utc" '+%F %T' 2>/dev/null && return 0
+    fi
+
+    date '+%F %T'
+}
+
+append_sage_jid_history() {
+    local jid="${1:-}"
+    local context="${2:-}"
+    local label="${3:-}"
+    local target_count="${4:-unknown}"
+    local rc="${5:-unknown}"
+
+    local history_dir="/var/log/salt"
+    local history_log="$history_dir/sage_history.log"
+    local history_lock="${history_log}.lock"
+    local history_time=""
+    local history_job="${SAGE_JOB_DIR:-$base_dir}"
+
+    [[ "$jid" =~ ^[0-9]+$ ]] || return 0
+
+    # context를 따로 넘기지 않으면 현재 salt_apply 실행 상태로 판단한다.
+    if [[ -z "$context" ]]; then
+        if [[ "${SALT_APPLY_CONTEXT:-default}" == "file_deploy" ]]; then
+            context="file_deploy"
+            label="${SAGE_FILE_DEPLOY_LABEL:-0000}:${JID_CHUNK_LABEL:-0/0}"
+        elif [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
+            context="chunk"
+            label="${JID_CHUNK_LABEL:-0/0}"
+        else
+            context="main"
+            label="-"
+        fi
+    fi
+
+    [[ -n "$label" ]] || label="-"
+    [[ -n "$target_count" ]] || target_count="unknown"
+
+    history_time="$(
+        __sage_jid_history_time "$jid"
+    )"
+
+	mkdir -p "$history_dir" 2>/dev/null || return 0
+	
+	(
+	    flock -x 200
+	
+	    # 같은 JID는 history에 한 번만 기록한다.
+	    if [[ -s "$history_log" ]] &&
+	        grep -Fq -- $'\tJID: '"$jid"$'\t' "$history_log"
+	    then
+	        exit 0
+	    fi
+	
+		case "$context" in
+		    file_deploy)
+		        printf '%s\tJOB: %s\tTYPE: FILE_DEPLOY\tLABEL: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
+		            "$history_time" \
+		            "$history_job" \
+		            "$label" \
+		            "$jid" \
+		            "$target_count" \
+		            "$rc" \
+		            >> "$history_log"
+		        ;;
+		
+		    chunk)
+		        printf '%s\tJOB: %s\tTYPE: JID_CHUNK\tLABEL: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
+		            "$history_time" \
+		            "$history_job" \
+		            "$label" \
+		            "$jid" \
+		            "$target_count" \
+		            "$rc" \
+		            >> "$history_log"
+		        ;;
+		
+		    main)
+		        printf '%s\tJOB: %s\tTYPE: MAIN\tLABEL: -\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
+		            "$history_time" \
+		            "$history_job" \
+		            "$jid" \
+		            "$target_count" \
+		            "$rc" \
+		            >> "$history_log"
+		        ;;
+		esac
+	
+	) 200>"$history_lock" 2>/dev/null || true
+	
+	return 0
+
+}
+
+# ============================================================
 # sage Salt 실행 히스토리 기록
 # ============================================================
 # salt_apply 실행 후 전역 히스토리 로그를 남긴다.
@@ -1882,7 +2047,6 @@ write_sage_history() {
     local history_log="$history_dir/sage_history.log"
     local history_jid="no_jid"
     local history_rc="${SALT_RC:-unknown}"
-    local chunk_line=""
     local chunk_label=""
     local chunk_jid=""
     local chunk_targets=""
@@ -1893,6 +2057,10 @@ write_sage_history() {
     {
         mkdir -p "$history_dir"
 
+        # ----------------------------------------------------
+        # 기존 메인/청크 JID 이력
+        # 기존 async_jid 포맷과 기록 방식은 그대로 유지한다.
+        # ----------------------------------------------------
         if [[ -s "$log_dir/async_jid" ]] && grep -Eq '^[0-9]+/[0-9]+[[:space:]]+' "$log_dir/async_jid"; then
             while IFS=$'\t' read -r chunk_label chunk_jid chunk_targets chunk_rc; do
                 [[ -z "${chunk_label:-}" ]] && continue
@@ -1900,41 +2068,41 @@ write_sage_history() {
                 [[ -z "${chunk_targets:-}" ]] && chunk_targets="unknown"
                 [[ -z "${chunk_rc:-}" ]] && chunk_rc="$history_rc"
 
-                printf '%s\tJOB: %s\tJID_CHUNK: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
-                    "$(date '+%F %T')" \
-                    "$base_dir" \
-                    "$chunk_label" \
-                    "$chunk_jid" \
-                    "$chunk_targets" \
-                    "$chunk_rc" \
-                    >> "$history_log"
+				append_sage_jid_history \
+			    "$chunk_jid" \
+			    "chunk" \
+			    "$chunk_label" \
+			    "$chunk_targets" \
+			    "$chunk_rc"
+	 
             done < "$log_dir/async_jid"
 
-            chunk_total="$(awk -F '[\t/]' 'NF >= 2 {v=$2} END {print v}' "$log_dir/async_jid")"
-            chunk_done="$(awk -F '[\t/]' 'NF >= 2 {v=$1} END {print v}' "$log_dir/async_jid")"
+            chunk_total="$(awk -F '[\t/]' 'NF >= 2 {value = $2} END {print value}' "$log_dir/async_jid")"
+            chunk_done="$(awk -F '[\t/]' 'NF >= 2 {value = $1} END {print value}' "$log_dir/async_jid")"
 
             [[ -z "$chunk_total" ]] && chunk_total="unknown"
             [[ -z "$chunk_done" ]] && chunk_done="unknown"
 
-            printf '%s\tJOB: %s\tJID_CHUNK_SUMMARY: %s/%s\tTOTAL_TARGETS: %s\tSALT_RC: %s\n' \
-                "$(date '+%F %T')" \
-                "$base_dir" \
-                "$chunk_done" \
-                "$chunk_total" \
-                "${server_count:-unknown}" \
-                "$history_rc" \
-                >> "$history_log"
-        else
+	        printf '%s\tJOB: %s\tTYPE: JID_CHUNK_SUMMARY\tLABEL: %s/%s\tJID: -\tTARGETS: %s\tSALT_RC: %s\n' \
+			    "$(date '+%F %T')" \
+			    "${SAGE_JOB_DIR:-$base_dir}" \
+			    "$chunk_done" \
+			    "$chunk_total" \
+			    "${server_count:-unknown}" \
+			    "$history_rc" \
+			    >> "$history_log"
+		else
             if [[ -s "$log_dir/async_jid" ]]; then
                 history_jid="$(head -n 1 "$log_dir/async_jid" | tr -d '\r\n')"
             fi
+				
+				append_sage_jid_history \
+				    "$history_jid" \
+				    "main" \
+				    "-" \
+				    "${server_count:-unknown}" \
+				    "$history_rc"
 
-            printf '%s\tJOB: %s\tJID: %s\tSALT_RC: %s\n' \
-                "$(date '+%F %T')" \
-                "$base_dir" \
-                "$history_jid" \
-                "$history_rc" \
-                >> "$history_log"
         fi
     } 2>/dev/null || true
 }
@@ -2412,7 +2580,7 @@ echo
 case "${ASYNC:-false}" in
     true|TRUE|True|1|yes|YES|Yes|y|Y)
         if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-            echo "  → Salt job 등록 후 event 결과 수집"		
+            echo "  → Salt job 등록 후 event 결과 수집"
 		else
             echo "  → Salt job 등록 후 종료"
 		fi
@@ -2450,6 +2618,7 @@ case "$answer" in
         # salt_apply/post에서 사용할 변수 export
         export home_dir base_dir framework_dir log_dir result_dir error_dir tmp_dir server_list server_count apply_dir
 		export FRAMEWORK_EXEC_MASTER FRAMEWORK_EXEC_MASTER_IPS
+        export SAGE_RUN_ID JID_REGISTRY_FILE JID_REGISTRY_LOCK_FILE
         [[ -n "${BATCH:-}" ]] && export BATCH
         [[ -n "${TIMEOUT:-}" ]] && export TIMEOUT
         [[ -n "${ASYNC:-}" ]] && export ASYNC
@@ -2463,7 +2632,12 @@ case "$answer" in
         export DEBUG_MODE DEBUG_PRINT DEBUG_LOG
         export SALT_FUNCTION
 
-        # 실제 Salt 실행
+        # 원본 Sage 작업 경로
+        # file_deploy 내부에서 base_dir이 임시 작업 경로로 변경되어도
+        # sage_history.log의 JOB에는 원래 작업 경로를 사용한다.
+        SAGE_JOB_DIR="$base_dir"
+        export SAGE_JOB_DIR
+
         if [[ ! -f "$framework_dir/salt_apply" ]]; then
             echo "salt_apply 파일 없음: $framework_dir/salt_apply"
             exit 1
@@ -2499,7 +2673,7 @@ case "$answer" in
                     echo "  결과 수집 : event listener"
                 elif [[ -s "$log_dir/async_jid" ]]; then
                     async_jid_value="$(head -n 1 "$log_dir/async_jid")"
-                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"                
+                    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$async_jid_value"
 				fi
 
                 echo
