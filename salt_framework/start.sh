@@ -549,6 +549,15 @@ fi
 
 LOCK_ACQUIRED=1
 
+# lock 획득 이후 cleanup()이 등록되기 전에 종료되더라도
+# .run.lock 파일이 남지 않도록 즉시 임시 EXIT trap을 등록한다.
+# 아래에서 전체 cleanup()이 정의된 뒤 `trap cleanup EXIT`으로 교체된다.
+trap '
+    if [[ "${LOCK_ACQUIRED:-0}" -eq 1 && -n "${lock_file:-}" ]]; then
+        rm -f "$lock_file"
+    fi
+' EXIT
+
 # ============================================================
 # 실행 산출물 디렉토리 초기화
 # 중복 실행 lock을 잡은 뒤에만 지운다.
