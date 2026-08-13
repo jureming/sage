@@ -358,7 +358,7 @@ for attempt in range(1, 6):
     time.sleep(10)
 
 print("async_done_event_send_failed_after_retries", file=sys.stderr)
-sys.exit(0)
+sys.exit(1)
 PYASYNC
 }
 

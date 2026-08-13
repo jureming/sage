@@ -558,6 +558,12 @@ result_dir="$base_dir/result"
 error_dir="$base_dir/error"
 tmp_dir="$base_dir/.tmp"
 
+if [[ -s "$tmp_dir/async_pending" ]]; then
+    echo "이전 ASYNC_RESULT 작업의 결과를 아직 수집 중입니다."
+    echo "확인 경로: $tmp_dir/async_pending"
+    exit 1
+fi
+
 rm -rf "$log_dir" "$result_dir" "$error_dir" "$tmp_dir"
 
 mkdir -p "$log_dir"
@@ -839,9 +845,8 @@ file_deploy_stage_root="$apply_dir/sage_file_deploy/$sage_file_deploy_run_id"
 # ============================================================
 # Sage 실행 단위 JID registry
 #
-# jid_registry:
-#   현재 Sage 실행에서 생성된 모든 Salt JID 추적용
-#   main, chunk, file_deploy JID를 모두 기록한다.
+# 현재 run에서 발급된 main/chunk/file_deploy JID를 발급 직후 기록한다.
+# Ctrl+C/TERM 취소 시 이 파일만 기준으로 현재 Sage가 만든 JID를 선별한다.
 # ============================================================
 SAGE_RUN_ID="$sage_file_deploy_run_id"
 JID_REGISTRY_FILE="$log_dir/jid_registry"
@@ -853,25 +858,695 @@ export SAGE_RUN_ID
 export JID_REGISTRY_FILE
 export JID_REGISTRY_LOCK_FILE
 
-cleanup() {
-    if [[ "$KEEP_TMP" -eq 1 ]]; then
-        echo "[DEBUG] tmp 유지: $tmp_dir"
-    else
-        rm -rf "$tmp_dir"
+# ============================================================
+# Sage 실행 단위 취소 상태
+# ============================================================
+# 취소 상태와 작업 파일은 현재 실행의 .tmp 아래에 유지한다.
+#
+# cancelled       : Ctrl+C/TERM 요청 marker.
+#                   신규 JID 제출 및 후속 처리 차단 기준
+# cancel.log      : 취소 처리 이력
+# jid_registering : JID 발급 직후 registry 기록이 끝날 때까지의 보호 marker
+# cancel_work/    : JID별 취소 상태 확인 및 term/kill 작업 파일
+#
+# 일반 실행 및 취소 종료 시 .tmp는 start.sh cleanup에서 삭제한다.
+# ASYNC_RESULT=true로 정상 handoff된 경우에는 listener가
+# 전체 결과 수신 및 post 처리 완료 후 .tmp를 삭제한다.
+#
+# CANCEL_* 값은 취소 확인용 Salt CLI의 응답/하드 timeout과
+# TERM -> KILL 전환 대기 시간을 제한한다.
+# ============================================================
+SAGE_CANCEL_MARKER="$tmp_dir/cancelled"
+SAGE_CANCEL_LOG="$tmp_dir/cancel.log"
+SAGE_JID_PROTECT_MARKER="$tmp_dir/jid_registering"
+
+CANCEL_REQUESTED=0
+CANCEL_IN_PROGRESS=0
+CANCEL_SIGNAL=""
+CANCEL_KEEP_FILE_DEPLOY_STAGE=0
+CANCEL_SALT_TIMEOUT="${CANCEL_SALT_TIMEOUT:-2}"
+CANCEL_COMMAND_HARD_TIMEOUT="${CANCEL_COMMAND_HARD_TIMEOUT:-8}"
+CANCEL_TERM_WAIT="${CANCEL_TERM_WAIT:-2}"
+CANCEL_KILL_WAIT="${CANCEL_KILL_WAIT:-1}"
+CANCEL_TARGET_CHUNK_SIZE="${CANCEL_TARGET_CHUNK_SIZE:-200}"
+SAGE_ACTIVE_WAIT_PID=""
+SAGE_ROOT_BASHPID="$BASHPID"
+
+export SAGE_ROOT_BASHPID
+export SAGE_CANCEL_MARKER
+export SAGE_CANCEL_LOG
+export SAGE_JID_PROTECT_MARKER
+
+# ============================================================
+# Sage 취소 로그
+# ============================================================
+sage_cancel_log() {
+    mkdir -p "$tmp_dir" 
+
+    printf '%s\t%s\n' \
+        "$(date '+%F %T')" \
+        "$*" \
+        >> "$SAGE_CANCEL_LOG"
+}
+
+# 진행률 출력이 \r로 같은 줄을 갱신 중이어도 취소 안내가 보이도록
+# 가능하면 제어 터미널(/dev/tty)에 직접 출력하고, 실패하면 stderr로 보낸다.
+sage_cancel_notice() {
+    local message="$1"
+
+    if { printf '%s\n' "$message" > /dev/tty; } 2>/dev/null; then
+        return 0
     fi
 
-    # Salt fileserver에 임시로 노출한 file_deploy source 정리
-    if [[ -n "${file_deploy_stage_root:-}" ]]; then
-        rm -rf "$file_deploy_stage_root"
-        rmdir "$apply_dir/sage_file_deploy" 2>/dev/null || true
+    printf '%s\n' "$message" >&2
+}
+# ============================================================
+# saltutil.find_job JSON에서 상태 판정 가능한 minion key 추출
+#
+# mode:
+#   responded : value가 object인 정상 응답 minion
+#   active    : value가 비어 있지 않은 object인 실행 중 minion
+# ============================================================
+sage_cancel_json_keys() {
+    local json_file="$1"
+    local mode="$2"
+
+    python3 - "$json_file" "$mode" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+mode = sys.argv[2]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+for host, value in data.items():
+    # saltutil.find_job의 정상 응답은 dict다.
+    # {}        = 해당 JID가 현재 실행 중이 아님
+    # non-empty = 현재 실행 중
+    #
+    # timeout/error 문자열 등은 정상 find_job 응답으로 보지 않는다.
+    if mode == "responded":
+        if isinstance(value, dict):
+            print(host)
+
+    elif mode == "active":
+        if isinstance(value, dict) and len(value) > 0:
+            print(host)
+PY
+}
+
+# ============================================================
+# CSV target -> 정렬된 host 파일
+# ============================================================
+sage_cancel_targets_to_file() {
+    local targets="$1"
+    local output_file="$2"
+
+    printf '%s\n' "$targets" \
+        | tr ',' '\n' \
+        | sed '/^[[:space:]]*$/d' \
+        | sort -u \
+        > "$output_file"
+}
+
+
+# ============================================================
+# host 파일을 CANCEL_TARGET_CHUNK_SIZE 단위로 분리
+# ============================================================
+sage_cancel_make_chunks() {
+    local target_file="$1"
+    local chunk_dir="$2"
+
+    rm -rf "$chunk_dir"
+    mkdir -p "$chunk_dir"
+
+    split \
+        -d \
+        -a 5 \
+        -l "$CANCEL_TARGET_CHUNK_SIZE" \
+        "$target_file" \
+        "$chunk_dir/chunk_"
+}
+
+
+# ============================================================
+# 특정 JID 상태 조회
+#
+# saltutil.find_job만 사용해 현재 실행 상태를 확인한다.
+# 생성 파일:
+#   expected  : 조회 대상
+#   responded : find_job이 정상 object로 응답한 대상
+#   active    : find_job 결과가 비어 있지 않은 실행 중 대상
+#   inactive  : find_job이 {}로 응답한 종료/미실행 대상
+#   unknown   : timeout/error 등으로 정상 응답을 확인하지 못한 대상
+# ============================================================
+sage_cancel_find_state() {
+    local jid="$1"
+    local targets="$2"
+    local state_dir="$3"
+
+    local salt_bin="${SALT_BIN:-$(command -v salt 2>/dev/null)}"
+    local target_file="$state_dir/expected"
+    local chunk_dir="$state_dir/chunks"
+    local responded_file="$state_dir/responded"
+    local active_file="$state_dir/active"
+    local inactive_file="$state_dir/inactive"
+    local unknown_file="$state_dir/unknown"
+    local chunk_file
+    local chunk_targets
+    local find_json
+    local find_err
+    local command_rc
+
+    rm -rf "$state_dir"
+    mkdir -p "$state_dir"
+
+    sage_cancel_targets_to_file "$targets" "$target_file"
+
+    : > "$responded_file"
+    : > "$active_file"
+    : > "$inactive_file"
+    : > "$unknown_file"
+
+    sage_cancel_make_chunks "$target_file" "$chunk_dir"
+
+    for chunk_file in "$chunk_dir"/chunk_*; do
+        [[ -f "$chunk_file" ]] || continue
+        [[ -s "$chunk_file" ]] || continue
+
+        chunk_targets="$(paste -sd, "$chunk_file")"
+
+        find_json="${chunk_file}.find.json"
+        find_err="${chunk_file}.find.err"
+
+        timeout \
+            --signal=TERM \
+            --kill-after=2 \
+            "${CANCEL_COMMAND_HARD_TIMEOUT}s" \
+            "$salt_bin" \
+            -t "$CANCEL_SALT_TIMEOUT" \
+            --out=json \
+            --static \
+            -L "$chunk_targets" \
+            saltutil.find_job "$jid" \
+            > "$find_json" \
+            2> "$find_err"
+
+        command_rc=$?
+
+        if sage_cancel_json_keys "$find_json" responded \
+            >> "$responded_file" 2>/dev/null
+        then
+            sage_cancel_json_keys "$find_json" active \
+                >> "$active_file" 2>/dev/null || true
+        else
+            sage_cancel_log \
+                "find_job_parse_failed jid=$jid targets=$chunk_targets rc=$command_rc"
+        fi
+
+        if [[ "$command_rc" -ne 0 ]]; then
+            sage_cancel_log \
+                "find_job_command_rc jid=$jid targets=$chunk_targets rc=$command_rc"
+        fi
+    done
+
+    sort -u -o "$responded_file" "$responded_file"
+    sort -u -o "$active_file" "$active_file"
+
+    # 정상 find_job 응답은 했지만 현재 해당 JID가 실행 중이 아닌 대상
+    comm -23 \
+        "$responded_file" \
+        "$active_file" \
+        > "$inactive_file"
+
+    # 정상 find_job 응답 자체를 확인하지 못한 대상
+    comm -23 \
+        "$target_file" \
+        "$responded_file" \
+        > "$unknown_file"
+
+    return 0
+}
+
+
+# ============================================================
+# host 파일의 대상에게 term_job / kill_job 실행
+# ============================================================
+sage_cancel_signal_hosts() {
+    local jid="$1"
+    local host_file="$2"
+    local function_name="$3"
+    local work_dir="$4"
+
+    local salt_bin="${SALT_BIN:-$(command -v salt 2>/dev/null)}"
+    local chunk_dir="$work_dir/${function_name}_chunks"
+    local chunk_file
+    local chunk_targets
+    local output_file
+    local error_file
+    local command_rc
+
+    [[ -s "$host_file" ]] || return 0
+
+    sage_cancel_make_chunks "$host_file" "$chunk_dir"
+
+    for chunk_file in "$chunk_dir"/chunk_*; do
+        [[ -f "$chunk_file" ]] || continue
+        [[ -s "$chunk_file" ]] || continue
+
+        chunk_targets="$(paste -sd, "$chunk_file")"
+
+        output_file="${chunk_file}.out"
+        error_file="${chunk_file}.err"
+
+        timeout \
+            --signal=TERM \
+            --kill-after=5 \
+            "${CANCEL_COMMAND_HARD_TIMEOUT}s" \
+            "$salt_bin" \
+            -t "$CANCEL_SALT_TIMEOUT" \
+            --out=json \
+            --static \
+            -L "$chunk_targets" \
+            "saltutil.${function_name}" "$jid" \
+            > "$output_file" \
+            2> "$error_file"
+
+        command_rc=$?
+
+        sage_cancel_log \
+            "${function_name} jid=$jid targets=$chunk_targets rc=$command_rc"
+    done
+
+    return 0
+}
+
+
+# ============================================================
+# 단일 JID 취소
+#
+# 순서:
+#   find_job으로 active 확인
+#   -> active 대상 term_job
+#   -> 짧게 대기 후 최초 active 대상만 find_job 재확인
+#   -> 남은 active 대상 kill_job
+#   -> 짧게 대기 후 강제 종료 대상만 최종 확인
+#
+# 상태를 확인하지 못한 host는 unconfirmed로 남겨 file_deploy staging
+# 삭제 여부를 보수적으로 판단한다.
+# ============================================================
+sage_cancel_one_jid() {
+    local context="$1"
+    local label="$2"
+    local jid="$3"
+    local target_count="$4"
+    local targets="$5"
+
+    local jid_dir="$tmp_dir/cancel_work/$jid"
+	local before_dir="$jid_dir/before"
+    local after_term_dir="$jid_dir/after_term"
+    local final_dir="$jid_dir/final"
+    local unconfirmed_file="$jid_dir/unconfirmed"
+
+    local active_before=0
+    local inactive_before=0
+    local unknown_before=0
+
+    local active_after_term=0
+    local inactive_after_term=0
+    local unknown_after_term=0
+
+    local active_final=0
+    local inactive_final=0
+    local unknown_final=0
+
+    local after_term_targets=""
+    local final_targets=""
+
+    sage_cancel_log \
+        "jid_cancel_start context=$context label=$label jid=$jid target_count=$target_count"
+
+    # --------------------------------------------------------
+    # 최초에는 original targets 전체에서 실제 실행 중 host를 찾는다.
+    # --------------------------------------------------------
+    sage_cancel_find_state \
+        "$jid" \
+        "$targets" \
+        "$before_dir"
+
+    active_before="$(wc -l < "$before_dir/active")"
+    inactive_before="$(wc -l < "$before_dir/inactive")"
+    unknown_before="$(wc -l < "$before_dir/unknown")"
+
+    sage_cancel_log \
+        "jid_state_before context=$context label=$label jid=$jid active=$active_before inactive=$inactive_before unknown=$unknown_before"
+
+    # --------------------------------------------------------
+    # 현재 실행 중으로 확인된 host에만 SIGTERM
+    # --------------------------------------------------------
+    if [[ "$active_before" -gt 0 ]]; then
+        sage_cancel_signal_hosts \
+            "$jid" \
+            "$before_dir/active" \
+            "term_job" \
+            "$jid_dir"
+
+        sleep "$CANCEL_TERM_WAIT"
     fi
+
+    # --------------------------------------------------------
+    # TERM 이후에는 최초 active였던 host만 다시 확인
+    # --------------------------------------------------------
+    after_term_targets="$(paste -sd, "$before_dir/active" 2>/dev/null || true)"
+
+    sage_cancel_find_state \
+        "$jid" \
+        "$after_term_targets" \
+        "$after_term_dir"
+
+    active_after_term="$(wc -l < "$after_term_dir/active")"
+    inactive_after_term="$(wc -l < "$after_term_dir/inactive")"
+    unknown_after_term="$(wc -l < "$after_term_dir/unknown")"
+
+    sage_cancel_log \
+        "jid_state_after_term context=$context label=$label jid=$jid active=$active_after_term inactive=$inactive_after_term unknown=$unknown_after_term"
+
+    # --------------------------------------------------------
+    # SIGTERM 이후에도 실행 중인 host에만 SIGKILL
+    # --------------------------------------------------------
+    if [[ "$active_after_term" -gt 0 ]]; then
+        sage_cancel_signal_hosts \
+            "$jid" \
+            "$after_term_dir/active" \
+            "kill_job" \
+            "$jid_dir"
+
+        sleep "$CANCEL_KILL_WAIT"
+    fi
+
+    # --------------------------------------------------------
+    # KILL 이후에도 방금 active였던 host만 최종 확인
+    # --------------------------------------------------------
+    final_targets="$(paste -sd, "$after_term_dir/active" 2>/dev/null || true)"
+
+    sage_cancel_find_state \
+        "$jid" \
+        "$final_targets" \
+        "$final_dir"
+
+    active_final="$(wc -l < "$final_dir/active")"
+    inactive_final="$(wc -l < "$final_dir/inactive")"
+    unknown_final="$(wc -l < "$final_dir/unknown")"
+
+    # 최초부터 상태 확인이 안 됐거나,
+    # TERM/KILL 이후 상태 확인이 안 된 host는 종료 미확인으로 남긴다.
+    {
+        cat "$before_dir/unknown"
+        cat "$after_term_dir/unknown"
+        cat "$final_dir/active"
+        cat "$final_dir/unknown"
+    } 2>/dev/null |
+        sed '/^[[:space:]]*$/d' |
+        sort -u \
+        > "$unconfirmed_file"
+
+    sage_cancel_log \
+        "jid_cancel_end context=$context label=$label jid=$jid active=$active_final inactive=$inactive_final unknown=$unknown_final unconfirmed=$(wc -l < "$unconfirmed_file")"
+
+    # file_deploy는 하나라도 종료 상태가 명확하지 않으면 staging 유지
+    if [[ "$context" == "file_deploy" ]] &&
+        [[ -s "$unconfirmed_file" ]]
+    then
+        CANCEL_KEEP_FILE_DEPLOY_STAGE=1
+
+        sage_cancel_log \
+            "file_deploy_stage_keep jid=$jid unconfirmed=$(wc -l < "$unconfirmed_file")"
+    fi
+
+    return 0
+}
+
+# ============================================================
+# 취소 시 현재 shell이 기다리는 로컬 Salt CLI process group 종료
+# ============================================================
+sage_cancel_stop_local_process_group() {
+    local pid="${1:-}"
+    local label="${2:-unknown}"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    sage_cancel_log \
+        "local_process_stop label=$label pid=$pid signal=TERM"
+
+    kill -TERM -- "-$pid" 2>/dev/null || true
+
+    sleep 0.2
+
+    if kill -0 "$pid" 2>/dev/null; then
+        sage_cancel_log \
+            "local_process_stop label=$label pid=$pid signal=KILL"
+
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+# ============================================================
+# 현재 Sage run 전체 취소
+#
+# 1) 현재 shell이 기다리는 조회/stream Salt CLI를 먼저 정리
+# 2) jid_registry를 snapshot한 뒤 최신 JID부터 역순 처리
+# 3) 각 JID는 term_job -> 필요 시 kill_job으로 종료
+# ============================================================
+run_sage_cancel_engine() {
+    local registry_snapshot="$tmp_dir/jid_registry.snapshot"
+	local registry_lock="${JID_REGISTRY_LOCK_FILE:-}"
+    local context
+    local label
+    local jid
+    local target_count
+    local targets
+
+    if [[ "${CANCEL_IN_PROGRESS:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    CANCEL_IN_PROGRESS=1
+
+    # 취소 엔진이 시작된 뒤 추가 Ctrl+C/TERM은 중복 처리하지 않는다.
+    trap '' INT TERM
+
+    set +e
+
+    mkdir -p "$tmp_dir" 
+
+    # 로컬 Salt CLI는 대기 해제용으로 먼저 종료한다.
+    # 실제 minion job은 아래 jid_registry 기반 term_job/kill_job으로 처리한다.
+    sage_cancel_stop_local_process_group \
+        "${SAGE_ACTIVE_WAIT_PID:-}" \
+        "salt_wait"
+    SAGE_ACTIVE_WAIT_PID=""
+
+    sage_cancel_stop_local_process_group \
+        "${SAGE_ACTIVE_SALT_PID:-}" \
+        "salt_stream"
+    SAGE_ACTIVE_SALT_PID=""
+
+    sage_cancel_log \
+        "cancel_engine_start run_id=$SAGE_RUN_ID signal=${CANCEL_SIGNAL:-unknown}"
+
+    : > "$registry_snapshot"
+
+    # registry append와 snapshot이 겹치지 않도록 동일 lock 사용
+    if [[ -n "$registry_lock" ]]; then
+        (
+            flock -x 200
+
+            if [[ -s "$JID_REGISTRY_FILE" ]]; then
+                awk -F $'\t' \
+                    -v run_id="$SAGE_RUN_ID" \
+                    '$1 == run_id' \
+                    "$JID_REGISTRY_FILE" \
+                    | tac \
+                    > "$registry_snapshot"
+            fi
+        ) 200>"$registry_lock"
+    elif [[ -s "$JID_REGISTRY_FILE" ]]; then
+        awk -F $'\t' \
+            -v run_id="$SAGE_RUN_ID" \
+            '$1 == run_id' \
+            "$JID_REGISTRY_FILE" \
+            | tac \
+            > "$registry_snapshot"
+    fi
+
+    if [[ ! -s "$registry_snapshot" ]]; then
+        sage_cancel_log \
+            "cancel_engine_no_registered_jid run_id=$SAGE_RUN_ID"
+    else
+        while IFS=$'\t' read -r \
+            _run_id \
+            context \
+            label \
+            jid \
+            target_count \
+            targets
+        do
+            [[ "$jid" =~ ^[0-9]+$ ]] || continue
+            [[ -n "$targets" ]] || continue
+
+            sage_cancel_one_jid \
+                "$context" \
+                "$label" \
+                "$jid" \
+                "$target_count" \
+                "$targets"
+        done < "$registry_snapshot"
+    fi
+
+    sage_cancel_log \
+        "cancel_engine_end run_id=$SAGE_RUN_ID keep_file_deploy_stage=$CANCEL_KEEP_FILE_DEPLOY_STAGE"
+
+    if [[ "${CANCEL_SIGNAL:-INT}" == "TERM" ]]; then
+        exit 143
+    fi
+
+    exit 130
+}
+# ============================================================
+# Sage 취소 요청 처리
+# ============================================================
+# 최초 신호에서 cancelled marker/log를 만든다.
+# JID가 registry에 기록 중이면 보호구간 종료까지 연기하고,
+# 그 외에는 즉시 run_sage_cancel_engine을 실행한다.
+# ============================================================
+handle_cancel() {
+    local signal_name="${1:-INT}"
+
+    # 실제 취소 엔진이 이미 실행 중이면
+    # 추가 Ctrl+C/TERM은 무시한다.
+    if [[ "${CANCEL_IN_PROGRESS:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    # 최초 취소 요청일 때만 marker/log 생성
+    if [[ "${CANCEL_REQUESTED:-0}" -ne 1 ]]; then
+        CANCEL_REQUESTED=1
+        CANCEL_SIGNAL="$signal_name"
+
+       	mkdir -p "$tmp_dir" 
+
+        printf '%s\trun_id=%s\tsignal=%s\n' \
+            "$(date '+%F %T')" \
+            "$SAGE_RUN_ID" \
+            "$signal_name" \
+            > "$SAGE_CANCEL_MARKER"
+
+        sage_cancel_log \
+            "cancel_requested run_id=$SAGE_RUN_ID signal=$signal_name"
+
+        sage_cancel_notice $'\n  Sage 작업 취소 요청을 받았습니다.'
+    fi
+
+    # Salt JID 발급 -> registry 기록 보호구간이면
+    # JID 등록을 완료한 뒤 취소 엔진을 실행한다.
+    if [[ -e "${SAGE_JID_PROTECT_MARKER:-}" ]]; then
+        sage_cancel_log \
+            "cancel_deferred run_id=$SAGE_RUN_ID reason=jid_registering"
+
+        sage_cancel_notice '  JID 등록을 완료한 후 작업을 중지합니다.'
+
+        return 0
+    fi
+
+    run_sage_cancel_engine
+}
+
+cleanup() {
+	# ============================================================
+	# Salt fileserver에 임시로 노출한 file_deploy source 정리
+	#
+	# 정상 종료:
+	#   staging 삭제
+	#
+	# 취소 종료:
+	#   모든 file_deploy JID가 inactive로 확인됐으면 삭제
+	#   active 또는 상태 미확인(unknown)이 남아 있으면 유지
+	# ============================================================
+	if [[ -n "${file_deploy_stage_root:-}" ]]; then
+	    if [[ "${CANCEL_KEEP_FILE_DEPLOY_STAGE:-0}" -eq 1 ]]; then
+	        echo
+	        echo "  file_deploy staging을 유지합니다."
+	        echo "  경로: $file_deploy_stage_root"
+	
+	        if [[ -n "${SAGE_CANCEL_LOG:-}" ]]; then
+	            printf '%s\tfile_deploy_stage_preserved\trun_id=%s\tpath=%s\n' \
+	                "$(date '+%F %T')" \
+	                "${SAGE_RUN_ID:-unknown}" \
+	                "$file_deploy_stage_root" \
+	                >> "$SAGE_CANCEL_LOG"
+	        fi
+	    else
+	        rm -rf "$file_deploy_stage_root"
+	        rmdir "$apply_dir/sage_file_deploy" 2>/dev/null || true
+	
+	        if [[ "${CANCEL_REQUESTED:-0}" -eq 1 ]] &&
+	            [[ -n "${SAGE_CANCEL_LOG:-}" ]]
+	        then
+	            printf '%s\tfile_deploy_stage_removed\trun_id=%s\tpath=%s\n' \
+	                "$(date '+%F %T')" \
+	                "${SAGE_RUN_ID:-unknown}" \
+	                "$file_deploy_stage_root" \
+	                >> "$SAGE_CANCEL_LOG"
+	        fi
+	    fi
+	fi
 
     if [[ "${LOCK_ACQUIRED:-0}" -eq 1 && -n "${lock_file:-}" ]]; then
         rm -f "$lock_file"
     fi
+
+	if [[ "${CANCEL_REQUESTED:-0}" -eq 1 ]]; then
+	    rm -rf "$tmp_dir"
+	
+	elif [[ "${ASYNC_RESULT_HANDOFF:-0}" -eq 1 ]]; then
+	    if [[ "$KEEP_TMP" -eq 1 ]]; then
+	        echo "[DEBUG] tmp 유지: $tmp_dir"
+	    else
+	        find "$tmp_dir" \
+	            -mindepth 1 -maxdepth 1 \
+	            ! -name 'async_pending' \
+	            ! -name 'result_status' \
+	            -exec rm -rf -- {} +
+
+			rmdir "$tmp_dir" 2>/dev/null || true
+
+	    fi
+	
+	elif [[ "$KEEP_TMP" -eq 1 ]]; then
+	    echo "[DEBUG] tmp 유지: $tmp_dir"
+	
+	else
+	    rm -rf "$tmp_dir"
+	fi
 }
 
-trap cleanup EXIT INT TERM
+trap 'handle_cancel INT' INT
+trap 'handle_cancel TERM' TERM
+trap cleanup EXIT
 
 # ============================================================
 # SLS 파일 경로 찾기
@@ -2142,7 +2817,7 @@ else
 fi
 
 # server 파일에서 중복을 제거한 전체 대상 목록 생성
-awk 'NF {print $1}' "$base_dir/server" | sort -u > "$tmp_dir/server_target"
+awk 'NF && $1 !~ /^#/ {print $1}' "$base_dir/server" | sort -u > "$tmp_dir/server_target"
 
 if [[ ! -s "$tmp_dir/server_target" ]]; then
     echo "⏹       server 대상 목록이 비어있습니다."
@@ -2403,33 +3078,6 @@ if post_has_effective_content "$base_dir/post"; then
 fi
 
 # ============================================================
-# Salt 실행 제목
-# ============================================================
-salt_section_title="대상 서버 실행"
-
-case "$SALT_FUNCTION" in
-    cmd.run)
-        if [[ "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT__" ]]; then
-            salt_section_title="remote 실행"
-        else
-            salt_section_title="cmd.run 실행"
-        fi
-        ;;
-
-    state.apply)
-        salt_section_title="state.apply 실행"
-        ;;
-
-    state.single)
-        if [[ "${SALT_ARGS[0]:-}" == "file.managed" ]]; then
-            salt_section_title="file.managed 실행"
-        else
-            salt_section_title="state.single 실행"
-        fi
-        ;;
-esac
-
-# ============================================================
 # 실제 Salt 실행 방식 표시
 # ============================================================
 # sage 실행 정보의 가운데 항목과 실제 실행 섹션 제목을
@@ -2586,12 +3234,11 @@ case "$answer" in
 
         # local 스크립트 실행
         # 최종 server 필터링 완료 후, Salt 실행 전에 master 로컬에서 수행한다.
-        run_user_local
-
-		# SALT_FUNCTION에 맞는 제목 출력
+		run_user_local
+		
 		sage_print_section "$salt_section_title"
-
-        . "$framework_dir/salt_apply"
+				
+		. "$framework_dir/salt_apply"
 
         # sage 실행 히스토리 기록
         # salt_apply 실행 후 메인 JID 청크 SUMMARY가 필요하면 기록한다.
@@ -2605,21 +3252,29 @@ case "$answer" in
             exit 1
         fi
 
-        case "${ASYNC:-false}" in
-            true|TRUE|True|1|yes|YES|Yes|y|Y)
-                sage_print_section "실행 완료"
-                echo "  Salt job 등록 완료"
-
-                if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
-                    echo "  결과 수집 : event listener"
-				elif [[ -n "${SAGE_LAST_JID:-}" ]]; then
-				    printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$SAGE_LAST_JID"
-				fi
-                echo
-                sage_print_line
-                exit 0
-                ;;
-        esac
+		case "${ASYNC:-false}" in
+		    true|TRUE|True|1|yes|YES|Yes|y|Y)
+		        sage_print_section "실행 완료"
+		        echo "  Salt job 등록 완료"
+		
+		        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+		            echo "  결과 수집 : event listener"
+		
+		            if [[ "$KEEP_TMP" -eq 1 ]]; then
+		                echo "  .tmp      : --keep-tmp 옵션으로 유지"
+		            else
+		                echo "  .tmp      : listener 전체 결과 수신 완료 후 자동 삭제"
+		            fi
+		
+		        elif [[ -n "${SAGE_LAST_JID:-}" ]]; then
+		            printf '  결과 조회 : salt-run jobs.lookup_jid %s --out=json\n' "$SAGE_LAST_JID"
+		        fi
+		
+		        echo
+		        sage_print_line
+		        exit 0
+		        ;;
+		esac
 
         # log_salt 파싱 후 result/error 디렉토리에 호스트별 결과 생성
         run_post

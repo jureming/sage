@@ -8,14 +8,12 @@ set -o pipefail
 # log            : Salt 실행 결과 JSON 로그
 # server_file    : 최종 실행 대상 서버 목록
 # completed      : 진행률 계산용 완료 서버 목록
-# async_jid_file : Salt JID 저장 파일
 # result_status  : JID missing 분류 임시 파일. post가 error 디렉토리로 반영
 # ============================================================
 log_dir="${log_dir:-$base_dir/log}"
 log="$log_dir/log_salt"
 server_file="$base_dir/server"
 completed="$base_dir/.tmp/completed"
-async_jid_file="$log_dir/async_jid"
 result_status="${RESULT_STATUS_FILE:-${tmp_dir:-$base_dir/.tmp}/result_status}"
 
 # ============================================================
@@ -42,6 +40,13 @@ DEBUG_LOG="${DEBUG_LOG:-$log_dir/debug.log}"
 SALT_APPLY_CONTEXT="${SALT_APPLY_CONTEXT:-default}"
 SALT_OUTPUT_PREFIX="  "
 
+# 현재 salt_apply 실행 결과를 start.sh에 전달하는 실행 상태 변수
+SAGE_LAST_JID=""
+SAGE_JID_CHUNK_USED=0
+SAGE_JID_CHUNK_DONE=0
+SAGE_JID_CHUNK_TOTAL=0
+SAGE_JID_CHUNK_TOTAL_TARGETS=0
+
 if [[ "$SALT_APPLY_CONTEXT" == "file_deploy" ]]; then
     SALT_OUTPUT_PREFIX="    "
 fi
@@ -50,7 +55,7 @@ fi
 mkdir -p "$base_dir/.tmp" "$log_dir"
 
 # 이전 로그 및 완료 목록 초기화
-rm -f "$log" "$async_jid_file" "$result_status"
+rm -f "$log" "$result_status"
 > "$completed"
 # result_status는 중간 분류가 하나도 없어도 debug/post 단계에서 참조될 수 있으므로
 # 빈 파일로 생성해 둔다.
@@ -169,6 +174,70 @@ run_with_hard_timeout() {
     else
         "$@"
     fi
+}
+
+# Salt 조회 명령을 별도 session으로 실행하고 shell builtin wait로 기다린다.
+# Ctrl+C/TERM 시 부모 Sage trap이 즉시 실행될 수 있게 하며,
+# SAGE_ACTIVE_WAIT_PID는 취소 엔진이 현재 조회 process group을 정리할 때 사용한다.
+run_with_hard_timeout_interruptible() {
+    local hard_timeout="$1"
+    shift
+
+    local setsid_bin=""
+    local child_pid=""
+    local command_rc=0
+    local had_errexit=0
+
+    # Salt 조회 프로세스를 띄우기 전부터 취소 trap을 보장한다.
+    if [[ "${BASHPID:-}" == "${SAGE_ROOT_BASHPID:-}" ]] &&
+        declare -F handle_cancel >/dev/null 2>&1
+    then
+        trap 'handle_cancel INT' INT
+        trap 'handle_cancel TERM' TERM
+    fi
+
+    setsid_bin="$(command -v setsid 2>/dev/null || true)"
+
+    if declare -F sage_cancel_requested >/dev/null 2>&1 &&
+        sage_cancel_requested
+    then
+        return 130
+    fi
+
+    if [[ -z "$setsid_bin" ]]; then
+        run_with_hard_timeout "$hard_timeout" "$@"
+        return $?
+    fi
+
+    if [[ -n "${TIMEOUT_BIN:-}" ]] &&
+        [[ -x "$TIMEOUT_BIN" ]] &&
+        [[ "$hard_timeout" =~ ^[0-9]+$ ]] &&
+        [[ "$hard_timeout" -gt 0 ]]
+    then
+        "$setsid_bin" \
+            "$TIMEOUT_BIN" -k 2 "$hard_timeout" \
+            "$@" &
+    else
+        "$setsid_bin" "$@" &
+    fi
+
+    child_pid=$!
+
+    SAGE_ACTIVE_WAIT_PID="$child_pid"
+
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
+    wait "$child_pid"
+    command_rc=$?
+
+    SAGE_ACTIVE_WAIT_PID=""
+
+    if [[ "$had_errexit" -eq 1 ]]; then
+        set -e
+    fi
+
+    return "$command_rc"
 }
 
 # ============================================================
@@ -369,6 +438,73 @@ if jid:
 PY
 }
 # ============================================================
+# JID 발급 -> jid_registry 기록 보호구간
+# ============================================================
+# JID는 발급됐지만 registry에 아직 기록되지 않은 짧은 구간에서
+# Ctrl+C/TERM이 들어오면 취소 대상을 놓칠 수 있으므로 marker를 유지한다.
+sage_jid_protect_begin() {
+    local marker="${SAGE_JID_PROTECT_MARKER:-}"
+
+    [[ -n "$marker" ]] || return 0
+
+    mkdir -p "$(dirname "$marker")"
+
+    printf '%s\tpid=%s\n' \
+        "$(date '+%F %T')" \
+        "${BASHPID:-$$}" \
+		> "$marker"
+}
+
+sage_jid_protect_end() {
+    local marker="${SAGE_JID_PROTECT_MARKER:-}"
+
+    [[ -n "$marker" ]] || return 0
+
+    rm -f "$marker"
+
+    # Ctrl+C/TERM이 JID 등록 보호구간에서 들어왔다면
+    # registry 기록이 끝난 직후 실제 취소 처리를 이어서 수행한다.
+    #
+    # file_deploy 등의 subshell에서는 부모 Sage가 취소를 담당하므로
+    # 최상위 Sage shell에서만 handle_cancel을 호출한다.
+    if sage_cancel_requested &&
+        [[ "${BASHPID:-}" == "${SAGE_ROOT_BASHPID:-}" ]] &&
+        declare -F handle_cancel >/dev/null 2>&1
+    then
+        handle_cancel "${CANCEL_SIGNAL:-INT}"
+    fi
+
+    return 0
+}
+
+sage_cancel_requested() {
+    [[ -n "${SAGE_CANCEL_MARKER:-}" ]] &&
+    [[ -s "${SAGE_CANCEL_MARKER:-}" ]]
+}
+
+# cancelled marker가 있으면 이후 main/chunk/file_deploy JID 제출을 차단한다.
+sage_cancel_block_new_submit() {
+    if ! sage_cancel_requested; then
+        return 1
+    fi
+
+    SALT_RC=130
+
+    if [[ -n "${SAGE_CANCEL_LOG:-}" ]]; then
+        printf '%s\tnew_jid_blocked\trun_id=%s\tcontext=%s\tlabel=%s\n' \
+            "$(date '+%F %T')" \
+            "${SAGE_RUN_ID:-unknown}" \
+            "${SALT_APPLY_CONTEXT:-default}" \
+            "${JID_CHUNK_LABEL:--}" \
+            >> "$SAGE_CANCEL_LOG"
+    fi
+
+    printf '%sSage 취소 요청으로 신규 Salt JID 제출을 중단합니다.\n' \
+        "${SALT_OUTPUT_PREFIX:-  }"
+
+    return 0
+}
+# ============================================================
 # Sage 실행 JID registry 기록
 #
 # registry 형식:
@@ -378,8 +514,6 @@ PY
 #   main        일반 Salt 실행
 #   chunk       일반 JID 청크 실행
 #   file_deploy file_deploy 실행
-#
-# async_jid의 기존 형식에는 영향을 주지 않는다.
 # ============================================================
 register_sage_jid() {
     local jid="${1:-}"
@@ -423,12 +557,15 @@ register_sage_jid() {
         flock -x 200
 
         # 동일 실행의 동일 JID는 한 번만 기록한다.
+        # Salt JID는 20자리 정수이므로 awk 숫자 비교를 사용하면
+        # double 정밀도 한계로 서로 다른 JID가 같게 비교될 수 있다.
+        # 반드시 문자열로 강제해 비교한다.
         if [[ -s "$registry_file" ]] &&
             awk -F $'\t' \
                 -v run_id="$SAGE_RUN_ID" \
                 -v target_jid="$jid" '
-                    $1 == run_id && $4 == target_jid {
-                        found = 1
+                    $1 == run_id && ($4 "") == (target_jid "") {
+						found = 1
                         exit
                     }
 
@@ -449,6 +586,42 @@ register_sage_jid() {
             "$targets" \
             >> "$registry_file"
     ) 200>"$registry_lock_file"
+}
+
+# ============================================================
+# 현재 Sage 실행의 registry에서 JID 조회
+#
+# 사용:
+#   get_sage_registered_jid main
+#   get_sage_registered_jid chunk 2/3
+#
+# 동일 조건이 여러 건이면 마지막 JID를 반환한다.
+# ============================================================
+get_sage_registered_jid() {
+    local context="${1:-main}"
+    local label="${2:-}"
+    local registry_file="${JID_REGISTRY_FILE:-}"
+
+    [[ -n "${SAGE_RUN_ID:-}" ]] || return 1
+    [[ -s "$registry_file" ]] || return 1
+
+    awk -F $'\t' \
+        -v run_id="$SAGE_RUN_ID" \
+        -v context="$context" \
+        -v label="$label" '
+            $1 == run_id && $2 == context && (label == "" || $3 == label) {
+                jid = $4
+            }
+
+            END {
+                if (jid != "") {
+                    print jid
+                    exit 0
+                }
+
+                exit 1
+            }
+        ' "$registry_file"
 }
 
 # ============================================================
@@ -652,26 +825,6 @@ with open(out_path, "w", encoding="utf-8") as out:
         if host not in classified:
             out.write(host + "\n")
 PY
-}
-
-# ============================================================
-# early check 결과 중 최종 실패로 볼 수 있는 상태만 result_status에 추가
-# - still_running 은 계속 대기 대상이므로 여기서는 제외한다.
-# - host 기준 중복은 첫 기록을 유지한다.
-# ============================================================
-append_non_running_status() {
-    local temp_status_file="$1"
-    local status_file="$2"
-    local dedup_file="$base_dir/.tmp/result_status_dedup"
-
-    if [[ ! -s "$temp_status_file" ]]; then
-        return 0
-    fi
-
-    awk -F '\t' '$2 != "still_running" {print}' "$temp_status_file" >> "$status_file"
-
-    awk -F '\t' '!seen[$1]++ {print}' "$status_file" > "$dedup_file"
-    mv "$dedup_file" "$status_file"
 }
 
 # ============================================================
@@ -1134,8 +1287,8 @@ if [[ "${SALT_FUNCTION:-}" == "cmd.run" && "${SALT_ARGS[0]:-}" == "__RUN_SCRIPT_
         fi
     fi
 
-    FRAMEWORK_RUN_ID="${FRAMEWORK_RUN_ID:-$(date '+%Y%m%d%H%M%S')_$$}"
-    FRAMEWORK_TASK_NAME="${FRAMEWORK_TASK_NAME:-$(basename "$base_dir")}"
+	FRAMEWORK_RUN_ID="${SAGE_RUN_ID:-$(date '+%Y%m%d%H%M%S')_$$}"
+	FRAMEWORK_TASK_NAME="${FRAMEWORK_TASK_NAME:-$(basename "$base_dir")}"
     FRAMEWORK_BASE_DIR="${FRAMEWORK_BASE_DIR:-$base_dir}"
     FRAMEWORK_STARTED_AT="${FRAMEWORK_STARTED_AT:-$(date '+%F %T')}"
     FRAMEWORK_STARTED_EPOCH="${FRAMEWORK_STARTED_EPOCH:-$(date +%s)}"
@@ -1294,44 +1447,93 @@ fi
 #   - BATCH(-b)는 사용하지 않음
 #   - 진행률 계산하지 않음
 #   - post 단계에서 result 파일 생성하지 않음
-#   - JID를 $log_dir/async_jid 에 저장
 # ============================================================
 if [[ "$ASYNC_MODE" -eq 1 ]]; then
     submit_log="$tmp_dir/async_submit"
+    ASYNC_RESULT_HANDOFF=0
+
     rm -f "$submit_log"
+
+    # 이미 Ctrl+C/TERM 취소 요청이 들어온 상태면
+    # 새로운 Salt JID를 제출하지 않는다.
+    if sage_cancel_block_new_submit; then
+        if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+            return 0
+        else
+            exit 130
+        fi
+    fi
+
+    # JID 발급부터 registry 기록 완료까지 보호한다.
+    # ASYNC_RESULT event가 매우 빨리 도착하더라도 listener는
+    # jid_registering marker가 사라질 때까지 처리를 기다린다.
+    sage_jid_protect_begin
+
+    # ASYNC_RESULT에서는 Sage 종료 후 listener가 결과를 수집해야 하므로
+    # 현재 run_id, 전체 대상, KEEP_TMP 값을 .tmp/async_pending에 저장한다.
+    #
+    # 형식:
+    #   run_id<TAB>host1,host2,...<TAB>KEEP_TMP
+    if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+        printf '%s\t%s\t%s\n' \
+            "$FRAMEWORK_RUN_ID" \
+            "$server_list" \
+            "${KEEP_TMP:-0}" \
+            > "$tmp_dir/async_pending"
+    fi
 
     set +e
 
-    PYTHONUNBUFFERED=1 stdbuf -oL -eL \
-    "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
-        "${SALT_CMD_OPT[@]}" \
-        --async \
-        --out=json \
-        "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
-        > "$submit_log" 2>&1
+    (
+        # JID 발급/registry 보호구간에서는
+        # 자식 Salt CLI가 직접 Ctrl+C/TERM을 받지 않게 한다.
+        trap '' INT TERM
+
+        export PYTHONUNBUFFERED=1
+
+        exec stdbuf -oL -eL \
+            "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
+            "${SALT_CMD_OPT[@]}" \
+            --async \
+            --out=json \
+            "$SALT_FUNCTION" "${SALT_ARGS[@]}"
+    ) > "$submit_log" 2>&1
 
     salt_rc=$?
 
     set -e
 
     cat "$submit_log" >> "$log"
-    async_jid="$(extract_jid_from_file "$submit_log")"
 
-    if [[ -n "$async_jid" ]]; then
-        echo "$async_jid" > "$async_jid_file"
-        register_sage_jid "$async_jid"
+    async_submit_jid="$(extract_jid_from_file "$submit_log")"
 
-        printf '  SALT START : %s\n' "$(__sage_jid_history_time "$async_jid")"
-        printf '  ASYNC JID  : %s\n' "$async_jid"
+    if [[ -n "$async_submit_jid" ]]; then
+        # JID 발급 직후 현재 Sage run의 registry에 즉시 기록한다.
+        register_sage_jid "$async_submit_jid"
+
+        SAGE_LAST_JID="$async_submit_jid"
+
+        printf '  SALT START : %s\n' "$(__sage_jid_history_time "$async_submit_jid")"
+        printf '  ASYNC JID  : %s\n' "$async_submit_jid"
     else
         printf '  SALT START : %s\n' "$(date '+%F %T')"
         echo "  ASYNC JID 확인 실패"
     fi
 
+    # registry 기록이 끝났으므로 JID 보호 marker를 제거한다.
+    # 보호구간에서 Ctrl+C/TERM이 들어왔다면 여기서 취소 처리를 이어간다.
+    sage_jid_protect_end
+
     printf '  SALT END   : %s\n' "$(date '+%F %T')"
 
-    if [[ "$salt_rc" -eq 0 && -n "$async_jid" ]]; then
+    if [[ "$salt_rc" -eq 0 && -n "$async_submit_jid" ]]; then
         SALT_RC=0
+
+        # ASYNC_RESULT JID가 정상 등록된 경우에만
+        # .tmp 상태 관리 책임을 listener에게 넘긴다.
+        if [[ "${ASYNC_RESULT_MODE:-0}" -eq 1 ]]; then
+            ASYNC_RESULT_HANDOFF=1
+        fi
     else
         echo
         printf '  SALT RETCODE : %s\n' "$salt_rc"
@@ -1344,13 +1546,23 @@ if [[ "$ASYNC_MODE" -eq 1 ]]; then
         SALT_RC=1
     fi
 
+    if [[ -n "$async_submit_jid" ]] &&
+        declare -F append_sage_jid_history >/dev/null 2>&1
+    then
+        append_sage_jid_history \
+            "$async_submit_jid" \
+            "main" \
+            "-" \
+            "$server_count" \
+            "$SALT_RC"
+    fi
+
     if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
         return 0
     else
         exit "$SALT_RC"
     fi
 fi
-
 # ============================================================
 # COLLECT_BY_JID=true 처리
 # ============================================================
@@ -1362,6 +1574,10 @@ fi
 #   5. post 단계에서 log_salt + result_status 를 사용해 result 생성
 # ============================================================
 run_collect_by_jid_once() {
+    if sage_cancel_block_new_submit; then
+        return 0
+    fi
+
     submit_log="$tmp_dir/jid_submit"
     missing_json="$base_dir/.tmp/jid_missing.json"
     missing_hosts="$base_dir/.tmp/jid_missing_hosts"
@@ -1369,7 +1585,6 @@ run_collect_by_jid_once() {
     find_job_json="$base_dir/.tmp/jid_find_job.json"
     early_status_tmp="$base_dir/.tmp/jid_early_status"
     final_stderr="$base_dir/.tmp/jid_final_stderr"
-    term_log="$base_dir/.tmp/jid_term_job.log"
 
     rm -f \
         "$submit_log" \
@@ -1378,28 +1593,35 @@ run_collect_by_jid_once() {
         "$active_missing_hosts" \
         "$find_job_json" \
         "$early_status_tmp" \
-        "$final_stderr" \
-        "$term_log"
+		"$final_stderr"
 
-    set +e
-
-    PYTHONUNBUFFERED=1 stdbuf -oL -eL \
-    "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
-        "${SALT_CMD_OPT[@]}" \
-        --async \
-        --out=json \
-        "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
-        > "$submit_log" 2>&1
-
-    submit_rc=$?
-
-    set -e
+	sage_jid_protect_begin
+	
+	set +e
+	
+	(
+	    trap '' INT TERM
+	
+	    export PYTHONUNBUFFERED=1
+	
+	    exec stdbuf -oL -eL \
+	        "$SALT_BIN" "${SALT_TARGET_OPT[@]}" \
+	        "${SALT_CMD_OPT[@]}" \
+	        --async \
+	        --out=json \
+	        "$SALT_FUNCTION" "${SALT_ARGS[@]}"
+	) > "$submit_log" 2>&1
+	
+	submit_rc=$?
+	
+	set -e
 
     jid="$(extract_jid_from_file "$submit_log")"
     debug_log "jid_submit rc=$submit_rc jid=$jid server_count=$server_count function=$SALT_FUNCTION args=${SALT_ARGS[*]}"
 
     if [[ "$submit_rc" -ne 0 || -z "$jid" ]]; then
-        printf '  SALT START   : %s\n' "$(date '+%F %T')"
+        sage_jid_protect_end
+		printf '  SALT START   : %s\n' "$(date '+%F %T')"
         echo "  Salt JID 발급 실패"
         printf '  SALT END     : %s\n' "$(date '+%F %T')"
         printf '  SALT RETCODE : %s\n' "$submit_rc"
@@ -1414,10 +1636,12 @@ run_collect_by_jid_once() {
     fi
 
     # 결과 조회를 시작하기 전에 JID를 공통 registry에 즉시 기록한다.
-    register_sage_jid "$jid"
+	register_sage_jid "$jid"
 	
-    if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
-        echo "$jid" > "$async_jid_file"
+	sage_jid_protect_end
+	
+	if [[ "${JID_CHUNK_ACTIVE:-0}" != "1" ]]; then
+		SAGE_LAST_JID="$jid"
     fi
 
     if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
@@ -1439,8 +1663,8 @@ run_collect_by_jid_once() {
     late_check_timeout="$(normalize_number "${LATE_CHECK_TIMEOUT:-5}" 5)"
 
     # Salt --timeout 과 별개로 salt/salt-run 프로세스 자체를 강제 종료할 상한값
-    late_check_hard_timeout="$(normalize_number "${LATE_CHECK_HARD_TIMEOUT:-12}" 12)"
-    lookup_hard_timeout="$(normalize_number "${LOOKUP_HARD_TIMEOUT:-30}" 30)"
+    late_check_hard_timeout="$(normalize_number "${LATE_CHECK_HARD_TIMEOUT:-15}" 15)"
+	lookup_hard_timeout="$(normalize_number "${LOOKUP_HARD_TIMEOUT:-30}" 30)"
     final_lookup_hard_timeout="$(normalize_number "${FINAL_LOOKUP_HARD_TIMEOUT:-300}" 300)"
     running_check_interval="$(normalize_number "${RUNNING_CHECK_INTERVAL:-30}" 30)"
 
@@ -1463,12 +1687,12 @@ run_collect_by_jid_once() {
     while true; do
         set +e
 
-        run_with_hard_timeout "$lookup_hard_timeout" \
-            "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
-                returned=False \
-                missing=True \
-                --out=json \
-                > "$missing_json" 2> "$base_dir/.tmp/jid_missing_stderr"
+		run_with_hard_timeout_interruptible "$lookup_hard_timeout" \
+		    "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
+		        returned=False \
+		        missing=True \
+		        --out=json \
+		        > "$missing_json" 2> "$base_dir/.tmp/jid_missing_stderr"
 
         lookup_rc=$?
 
@@ -1580,12 +1804,12 @@ run_collect_by_jid_once() {
                 if [[ -n "$ping_ok_csv" ]]; then
                     set +e
 
-                    run_with_hard_timeout "$late_check_hard_timeout" \
-                        "$SALT_BIN" -L "$ping_ok_csv" \
-                            --timeout="$late_check_timeout" \
-                            saltutil.find_job "$jid" \
-                            --out=json \
-                            > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
+					run_with_hard_timeout_interruptible "$late_check_hard_timeout" \
+					    "$SALT_BIN" -L "$ping_ok_csv" \
+					        --timeout="$late_check_timeout" \
+					        saltutil.find_job "$jid" \
+					        --out=json \
+					        > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
 
                     find_job_rc=$?
 
@@ -1676,12 +1900,12 @@ run_collect_by_jid_once() {
            if [[ -n "$ping_ok_csv" ]]; then
                set +e
 
-               run_with_hard_timeout "$late_check_hard_timeout" \
-                   "$SALT_BIN" -L "$ping_ok_csv" \
-                       --timeout="$late_check_timeout" \
-                       saltutil.find_job "$jid" \
-                       --out=json \
-                       > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
+				run_with_hard_timeout_interruptible "$late_check_hard_timeout" \
+				    "$SALT_BIN" -L "$ping_ok_csv" \
+				        --timeout="$late_check_timeout" \
+				        saltutil.find_job "$jid" \
+				        --out=json \
+				        > "$find_job_json" 2> "$base_dir/.tmp/jid_find_job_stderr"
 
                find_job_rc=$?
 
@@ -1720,12 +1944,12 @@ run_collect_by_jid_once() {
 
    set +e
 
-   run_with_hard_timeout "$final_lookup_hard_timeout" \
-       "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
-           returned=True \
-           missing=False \
-           --out=json \
-           > "$log" 2> "$final_stderr"
+	run_with_hard_timeout_interruptible "$final_lookup_hard_timeout" \
+	    "$SALT_RUN_BIN" jobs.lookup_jid "$jid" \
+	        returned=True \
+	        missing=False \
+	        --out=json \
+	        > "$log" 2> "$final_stderr"
 
    final_lookup_rc=$?
 
@@ -1748,25 +1972,16 @@ run_collect_by_jid_once() {
        SALT_RC=1
    fi
 
-   if [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
-       printf '%s\t%s\t%s\t%s\n' \
-           "${JID_CHUNK_LABEL:-0/0}" \
-           "$jid" \
-           "$server_count" \
-           "$SALT_RC" \
-           >> "$async_jid_file"
+   if declare -F append_sage_jid_history >/dev/null 2>&1; then
+       append_sage_jid_history \
+       "$jid" \
+       "" \
+       "" \
+       "$server_count" \
+       "$SALT_RC"
    fi
 
-	if declare -F append_sage_jid_history >/dev/null 2>&1; then
-		append_sage_jid_history \
-			"$jid" \
-			"" \
-			"" \
-			"$server_count" \
-			"$SALT_RC"
-	fi
-
-    return 0
+   return 0
 }
 
 # ============================================================
@@ -1827,7 +2042,6 @@ run_collect_by_jid_chunked() {
     rm -rf "$chunk_dir"
     mkdir -p "$chunk_dir"
     : > "$master_log"
-    : > "$async_jid_file"
 
     chunk_source_file="$master_server_file"
     chunk_order_label="정렬 순서"
@@ -1861,8 +2075,17 @@ run_collect_by_jid_chunked() {
     JID_CHUNK_TOTAL_TARGETS="$master_server_count"
     JID_CHUNK_COMPLETED_BEFORE=0
 
+    SAGE_JID_CHUNK_USED=1
+    SAGE_JID_CHUNK_DONE=0
+    SAGE_JID_CHUNK_TOTAL="$chunk_total"
+    SAGE_JID_CHUNK_TOTAL_TARGETS="$master_server_count"
+
     for chunk_file in "${chunk_files[@]}"; do
-        chunk_no=$(( chunk_no + 1 ))
+		if sage_cancel_block_new_submit; then
+			break
+		fi
+
+		chunk_no=$(( chunk_no + 1 ))
         chunk_label="${chunk_no}/${chunk_total}"
         chunk_count="$(wc -l < "$chunk_file")"
         chunk_log="$chunk_dir/log_salt_${chunk_no}"
@@ -1880,6 +2103,15 @@ run_collect_by_jid_chunked() {
         fi
 
         run_collect_by_jid_once
+
+        # JID가 실제 발급되어 registry에 등록된 chunk까지만
+        # SUMMARY 완료 수로 반영한다.
+        # JID 발급 자체가 실패한 chunk는 완료 수에 포함하지 않는다.
+        if [[ "${SALT_APPLY_CONTEXT:-default}" != "file_deploy" ]] &&
+            get_sage_registered_jid "chunk" "$chunk_label" >/dev/null 2>&1
+        then
+            SAGE_JID_CHUNK_DONE="$chunk_no"
+        fi
 
         if [[ -s "$chunk_log" ]]; then
             cat "$chunk_log" >> "$master_log"
@@ -1936,7 +2168,7 @@ fi
 # ============================================================
 # COLLECT_BY_JID=false 일 때 사용한다.
 #
-# JID는 --verbose 출력에서 추출해 async_jid에 저장하고,
+# JID는 --verbose 출력에서 추출해 jid_registry에 저장하고,
 # Salt 결과는 기존처럼 log_salt에 실시간 저장한다.
 # ============================================================
 SALT_STREAM_OPT=("${SALT_TARGET_OPT[@]}")
@@ -1945,28 +2177,66 @@ if [[ -n "${BATCH:-}" ]]; then
     SALT_STREAM_OPT+=(-b "$BATCH")
 fi
 
+# ============================================================
+# COLLECT_BY_JID=false Salt 실행
+# ============================================================
+# Salt CLI를 별도 session으로 실행해 터미널 Ctrl+C/TERM이
+# JID 출력 전에 Salt CLI를 직접 종료하지 않도록 한다.
+#
+# stdout/stderr는 FIFO를 통해 현재 shell에서 읽으므로
+# 기존 실시간 log_salt 수집/진행률 출력 방식은 유지한다.
+# ============================================================
+if sage_cancel_block_new_submit; then
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit 130
+    fi
+fi
+
+stream_fifo="$tmp_dir/salt_stream_fifo"
+rm -f "$stream_fifo"
+mkfifo "$stream_fifo"
+
+stream_jid_seen=""
+SAGE_ACTIVE_SALT_PID=""
+
+sage_jid_protect_begin
+
 set +e
 
-PYTHONUNBUFFERED=1 stdbuf -oL -eL \
-"$SALT_BIN" "${SALT_STREAM_OPT[@]}" \
+PYTHONUNBUFFERED=1 \
+setsid stdbuf -oL -eL \
+    "$SALT_BIN" "${SALT_STREAM_OPT[@]}" \
     "${SALT_CMD_OPT[@]}" \
     --verbose \
     --out=json \
     "$SALT_FUNCTION" "${SALT_ARGS[@]}" \
-    2>&1 |
+    > "$stream_fifo" 2>&1 &
+
+SAGE_ACTIVE_SALT_PID=$!
+
+debug_log "stream_start pid=$SAGE_ACTIVE_SALT_PID server_count=$server_count batch=${BATCH:-none} function=$SALT_FUNCTION args=${SALT_ARGS[*]}"
+
 while IFS= read -r line; do
     # 실제 Salt verbose 출력:
     # Executing job with jid 20260806013509514051
     if [[ "$line" =~ ^Executing[[:space:]]+job[[:space:]]+with[[:space:]]+jid[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
         stream_jid="${BASH_REMATCH[1]}"
 
-        if [[ ! -s "$async_jid_file" ]] ||
-            ! grep -Fxq "$stream_jid" "$async_jid_file"
-        then
-            printf '%s\n' "$stream_jid" >> "$async_jid_file"
-			register_sage_jid "$stream_jid"
+        if [[ "$stream_jid_seen" != "$stream_jid" ]]; then
+            stream_jid_seen="$stream_jid"
 
-			printf '  SALT START : %s\n' "$(__sage_jid_history_time "$stream_jid")" >&2
+            # JID 발급 직후 공통 registry에 즉시 기록한다.
+            register_sage_jid "$stream_jid"
+
+            # 첫 JID가 registry에 기록됐으므로
+            # JID 등록 보호구간을 종료한다.
+            if [[ -e "${SAGE_JID_PROTECT_MARKER:-}" ]]; then
+                sage_jid_protect_end
+            fi
+
+            printf '  SALT START : %s\n' "$(__sage_jid_history_time "$stream_jid")" >&2
             printf '  JID        : %s\n' "$stream_jid" >&2
             echo >&2
 
@@ -1991,9 +2261,21 @@ while IFS= read -r line; do
             draw_progress "$done_count" "$server_count"
         fi
     fi
-done
+done < "$stream_fifo"
 
-salt_rc=${PIPESTATUS[0]}
+wait "$SAGE_ACTIVE_SALT_PID"
+salt_rc=$?
+
+SAGE_ACTIVE_SALT_PID=""
+
+debug_log "stream_done jid=${stream_jid_seen:-unknown} rc=$salt_rc completed=$(wc -l < "$completed")/$server_count"
+
+# JID 발급 자체가 실패해서 marker가 아직 남아 있는 경우도 정리한다.
+if [[ -e "${SAGE_JID_PROTECT_MARKER:-}" ]]; then
+    sage_jid_protect_end
+fi
+
+rm -f "$stream_fifo"
 
 set -e
 
@@ -2021,17 +2303,17 @@ else
     SALT_RC=1
 fi
 
-if declare -F append_sage_jid_history >/dev/null 2>&1 &&
-    [[ -s "$async_jid_file" ]]
-then
-    while IFS= read -r history_jid; do
-        [[ "$history_jid" =~ ^[0-9]+$ ]] || continue
+history_jid="$(get_sage_registered_jid "main" "-" 2>/dev/null || true)"
 
+if [[ "$history_jid" =~ ^[0-9]+$ ]]; then
+    SAGE_LAST_JID="$history_jid"
+
+    if declare -F append_sage_jid_history >/dev/null 2>&1; then
         append_sage_jid_history \
             "$history_jid" \
             "main" \
             "-" \
             "$server_count" \
             "$SALT_RC"
-    done < "$async_jid_file"
+    fi
 fi

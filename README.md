@@ -198,7 +198,7 @@ file_deploy $base_dir/files/app.conf /etc/app/app.conf
 
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
-| `ASYNC` | `false` | `true`이면 `salt --async`로 job만 등록하고 일반 결과 수집/post를 생략합니다. JID는 `log/async_jid`에 저장합니다. |
+| `ASYNC` | `false` | `true`이면 `salt --async`로 job만 등록하고 일반 결과 수집/post를 생략합니다. JID는 `log/jid_registry`에 기록합니다. |
 | `COLLECT_BY_JID` | `true` | `ASYNC=false`일 때 JID 기반으로 진행률을 확인하고 마지막에 `jobs.lookup_jid` 결과를 수집합니다. `false`이면 기존 stdout 기반 수집을 사용합니다. |
 | `ASYNC_RESULT` | `false` | `ASYNC=true + cmd.run + RUN_SCRIPT` 전용입니다. minion에서 stdout/stderr/exit code를 event로 보내고 listener가 결과를 저장합니다. |
 | `JID_CHUNK_SIZE` | 미설정 | 미설정이면 대상이 200대 초과할 때 200이 자동 적용됩니다. 빈 값/0이면 자동 분할을 해제하고, 양의 정수이면 해당 개수 단위로 JID 기반 순차 실행합니다. `ASYNC=true` 또는 `COLLECT_BY_JID=false`와 같이 쓸 수 없습니다. |
@@ -252,12 +252,22 @@ ASYNC_RESULT/event 옵션:
 | 경로 | 설명 |
 | --- | --- |
 | `log/log_salt` | Salt 실행 또는 최종 `jobs.lookup_jid` 결과 JSON 로그입니다. |
-| `log/async_jid` | async/JID 실행에서 발급된 JID입니다. |
-| `log/async_done_hosts/<host>` | `ASYNC_RESULT`에서 listener가 실제 event를 받은 host marker입니다. |
+| `log/jid_registry` | 현재 Sage 실행에서 발급된 `main`, `chunk`, `file_deploy` JID 추적 파일입니다. 취소 처리도 이 파일 기준으로 수행합니다. |
 | `log/server_fail` | salt-key 미등록, ping 실패, dirty_nodes 제외 목록입니다. |
 | `log/debug.log` | debug 모드 로그입니다. |
+| `.tmp/async_pending` | `ASYNC_RESULT=true` 실행의 listener handoff 상태 파일입니다. 남아 있으면 이전 비동기 결과 수집이 아직 진행 중인 상태입니다. |
+| `.tmp/result_status` | JID missing/timeout 분류 및 `ASYNC_RESULT` 완료 host 상태 파일입니다. |
 | `result/<host>` | host별 정상 stdout 결과입니다. stdout이 없어도 성공이면 빈 파일이 생성될 수 있습니다. |
 | `error/<host>` | host별 stderr, 실패 stdout, `no_stderr`, timeout/미반환 분류 결과입니다. |
+
+## 실행 취소
+
+실행 중 `Ctrl+C` 또는 `TERM`을 받으면 현재 Sage 실행에서 발급된 JID를 `log/jid_registry` 기준으로 확인하고, 실행 중인 Salt job에 `saltutil.term_job` 후 필요 시 `saltutil.kill_job`을 시도합니다.
+
+- `main`, `JID_CHUNK_SIZE` 청크, `file_deploy` 실행 JID가 모두 취소 대상입니다.
+- 취소 요청 이후에는 새 Salt JID를 추가 제출하지 않습니다.
+- JID 발급 직후 registry 기록 전 취소 누락을 막기 위해 짧은 보호구간을 둡니다.
+- `file_deploy` 취소 중 종료 상태를 확인하지 못한 minion이 있으면 staging 경로를 삭제하지 않고 유지합니다.
 
 ## async result listener
 
@@ -267,7 +277,9 @@ ASYNC_RESULT/event 옵션:
 systemctl status salt-framework-event.service
 ```
 
-listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다. 모든 대상 host의 `log/async_done_hosts/<host>` marker가 생성되면 `post`가 유효할 때 한 번만 실행합니다.
+listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다.
+
+`ASYNC_RESULT=true` 실행은 `.tmp/async_pending`을 listener handoff marker로 사용합니다. listener는 `.tmp/result_status`에 host별 `async_done` 상태를 기록하고, 전체 대상 event를 받은 뒤 `post`를 한 번만 실행합니다. 완료 후 `--keep-tmp`가 아니면 listener가 `.tmp` 상태 파일을 정리합니다.
 
 ## NetBox inventory
 
@@ -324,6 +336,7 @@ get_valid_mailservers > "$base_dir/server"
 - `salt`, `salt-run`, `salt-key`
 - `jq`
 - `flock`
+- `setsid`
 - `timeout` 또는 호환 명령: 없으면 일부 hard timeout만 비활성화됩니다.
 
 ## 주의사항

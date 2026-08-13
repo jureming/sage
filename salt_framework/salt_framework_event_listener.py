@@ -15,6 +15,19 @@ EVENT_TAG_PATTERN = "salt/framework/async/*"
 LOG_FILE = "/var/log/salt/framework_event_listener.log"
 
 
+TRUE_VALUES = {
+    "1",
+    "true",
+    "TRUE",
+    "True",
+    "yes",
+    "YES",
+    "Yes",
+    "y",
+    "Y",
+}
+
+
 def log(message):
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"{now} {message}\n"
@@ -108,6 +121,19 @@ def is_safe_minion_id(minion_id):
     return True
 
 
+def is_safe_run_id(run_id):
+    if not run_id or len(run_id) > 128:
+        return False
+
+    if run_id in (".", ".."):
+        return False
+
+    if "/" in run_id or "\\" in run_id:
+        return False
+
+    return all(ch.isalnum() or ch in "._-" for ch in run_id)
+
+
 def write_text_file(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -121,6 +147,7 @@ def write_text_file(path, content):
             f.write(content + "\n")
         else:
             f.write("")
+
 
 def append_text_file(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -137,8 +164,7 @@ def append_text_file(path, content):
 
         if content:
             f.write(content + "\n")
-        elif not os.path.exists(path):
-            f.write("")
+
 
 def post_has_effective_content(post_file):
     if not os.path.isfile(post_file):
@@ -156,145 +182,177 @@ def post_has_effective_content(post_file):
     return False
 
 
-def get_expected_hosts(base_dir):
-    server_file = os.path.join(base_dir, "server")
-    hosts = []
+def parse_async_pending_line(line):
+    parts = line.rstrip("\n").split("\t")
+
+    if len(parts) != 3:
+        return None
+
+    pending_run_id = parts[0].strip()
+    hosts_raw = parts[1].strip()
+    keep_tmp_raw = parts[2].strip()
+
+    expected_hosts = []
     seen = set()
 
-    try:
-        with open(server_file, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
+    for host in hosts_raw.split(","):
+        host = host.strip()
 
-                host = stripped.split()[0]
-                if host and host not in seen:
-                    seen.add(host)
-                    hosts.append(host)
-    except Exception:
-        return []
+        if host and host not in seen:
+            seen.add(host)
+            expected_hosts.append(host)
 
-    return hosts
+    if not pending_run_id or not expected_hosts:
+        return None
+
+    keep_tmp = keep_tmp_raw in TRUE_VALUES
+
+    return pending_run_id, expected_hosts, keep_tmp
 
 
-def get_done_hosts(base_dir):
-    # ASYNC_RESULT에서는 local의 file_deploy가 remote 실행 전에
-    # error/<host>를 만들 수 있다. result/error 존재만으로 완료를 판단하면
-    # remote event가 오기 전에 post가 조기 실행될 수 있으므로,
-    # listener가 실제 event를 처리한 host marker를 우선 사용한다.
-    marker_dir = os.path.join(base_dir, "log", "async_done_hosts")
+def get_done_hosts(result_status_file):
     done = set()
 
-    if os.path.isdir(marker_dir):
-        try:
-            for name in os.listdir(marker_dir):
-                full_path = os.path.join(marker_dir, name)
+    try:
+        with open(result_status_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
 
-                if os.path.isfile(full_path):
-                    done.add(name)
-        except Exception:
-            pass
+                if len(parts) < 2:
+                    continue
 
-        return done
+                host = parts[0].strip()
+                status = parts[1].strip()
 
-    # 기존 실행과의 호환을 위한 fallback
-    for dirname in ("result", "error"):
-        path = os.path.join(base_dir, dirname)
-
-        try:
-            for name in os.listdir(path):
-                full_path = os.path.join(path, name)
-
-                if os.path.isfile(full_path):
-                    done.add(name)
-        except Exception:
-            continue
+                if host and status == "async_done":
+                    done.add(host)
+    except Exception:
+        pass
 
     return done
+
+
+def mark_done_host(result_status_file, minion_id):
+    done_hosts = get_done_hosts(result_status_file)
+
+    if minion_id in done_hosts:
+        return
+
+    with open(result_status_file, "a", encoding="utf-8") as f:
+        f.write(f"{minion_id}\tasync_done\n")
+        f.flush()
+        os.fsync(f.fileno())
+
 
 def run_post_once(base_dir, run_id):
     log_dir = os.path.join(base_dir, "log")
     post_file = os.path.join(base_dir, "post")
-    lock_file = os.path.join(log_dir, "post.lock")
-    done_file = os.path.join(log_dir, "post.done")
 
     if not post_has_effective_content(post_file):
-        log(f"post_skip reason=no_effective_post base_dir={base_dir} run_id={run_id}")
+        log(
+            f"post_skip reason=no_effective_post "
+            f"base_dir={base_dir} run_id={run_id}"
+        )
         return
 
-    os.makedirs(log_dir, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "home_dir": "/data/salt",
+            "base_dir": base_dir,
+            "log_dir": log_dir,
+            "result_dir": os.path.join(base_dir, "result"),
+            "error_dir": os.path.join(base_dir, "error"),
+            "tmp_dir": os.path.join(base_dir, ".tmp"),
+            "FRAMEWORK_RUN_ID": run_id,
+        }
+    )
 
-    with open(lock_file, "a+", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log(f"post_skip reason=post_locked base_dir={base_dir} run_id={run_id}")
-            return
+    log(f"post_start base_dir={base_dir} run_id={run_id}")
 
-        if os.path.exists(done_file) and os.path.getsize(done_file) > 0:
-            log(f"post_skip reason=post_already_done base_dir={base_dir} run_id={run_id}")
-            return
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "home_dir": "/data/salt",
-                "base_dir": base_dir,
-                "log_dir": log_dir,
-                "result_dir": os.path.join(base_dir, "result"),
-                "error_dir": os.path.join(base_dir, "error"),
-                "tmp_dir": os.path.join(base_dir, ".tmp"),
-                "FRAMEWORK_RUN_ID": run_id,
-            }
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", ". \"$1\"", "salt_framework_post", post_file],
+            cwd=base_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=3600,
         )
 
-        log(f"post_start base_dir={base_dir} run_id={run_id}")
+        rc = proc.returncode
+        stdout = proc.stdout.strip().replace("\n", "\\n")
+        stderr = proc.stderr.strip().replace("\n", "\\n")
 
-        try:
-            proc = subprocess.run(
-                ["bash", "-c", ". \"$1\"", "salt_framework_post", post_file],
-                cwd=base_dir,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=3600,
-            )
-            rc = proc.returncode
-            stdout = proc.stdout.strip().replace("\n", "\\n")
-            stderr = proc.stderr.strip().replace("\n", "\\n")
-            log(f"post_done base_dir={base_dir} run_id={run_id} rc={rc} stdout={stdout} stderr={stderr}")
-        except subprocess.TimeoutExpired:
-            rc = 124
-            log(f"post_done base_dir={base_dir} run_id={run_id} rc=124 error=post_timeout")
-        except Exception as e:
-            rc = 1
-            log(f"post_done base_dir={base_dir} run_id={run_id} rc=1 error={e}")
+        log(
+            f"post_done base_dir={base_dir} run_id={run_id} "
+            f"rc={rc} stdout={stdout} stderr={stderr}"
+        )
 
-        with open(done_file, "a", encoding="utf-8") as done:
-            done.write(f"{run_id}\trc={rc}\tended_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except subprocess.TimeoutExpired:
+        log(
+            f"post_done base_dir={base_dir} run_id={run_id} "
+            f"rc=124 error=post_timeout"
+        )
+
+    except Exception as e:
+        log(
+            f"post_done base_dir={base_dir} run_id={run_id} "
+            f"rc=1 error={e}"
+        )
 
 
-def maybe_run_post(base_dir, run_id):
-    expected_hosts = get_expected_hosts(base_dir)
-
-    if not expected_hosts:
-        log(f"post_wait reason=no_expected_hosts base_dir={base_dir} run_id={run_id}")
-        return
-
+def all_async_hosts_done(expected_hosts, result_status_file):
     expected_set = set(expected_hosts)
-    done_hosts = get_done_hosts(base_dir)
+    done_hosts = get_done_hosts(result_status_file)
     missing_hosts = sorted(expected_set - done_hosts)
 
     if missing_hosts:
+        log(
+            f"async_wait missing_count={len(missing_hosts)} "
+            f"missing={','.join(missing_hosts)}"
+        )
+        return False
+
+    return True
+
+
+def cleanup_async_tmp(base_dir, result_status_file, keep_tmp):
+    tmp_dir = os.path.join(base_dir, ".tmp")
+
+    if keep_tmp:
+        log(f"async_tmp_keep reason=keep_tmp base_dir={base_dir}")
         return
 
-    run_post_once(base_dir, run_id)
+    try:
+        if os.path.exists(result_status_file):
+            os.remove(result_status_file)
+    except Exception as e:
+        log(
+            f"async_tmp_cleanup_failed "
+            f"base_dir={base_dir} "
+            f"path={result_status_file} "
+            f"error={e}"
+        )
+        return
+
+    try:
+        os.rmdir(tmp_dir)
+        log(f"async_tmp_removed base_dir={base_dir}")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(
+            f"async_tmp_cleanup_deferred "
+            f"base_dir={base_dir} "
+            f"path={tmp_dir} "
+            f"error={e}"
+        )
 
 
 def handle_async_done(payload):
-    run_id = str(payload.get("run_id", "unknown"))
+    run_id = str(payload.get("run_id", "")).strip()
     base_dir = str(payload.get("base_dir", "")).strip()
     minion_id = str(payload.get("minion_id", "")).strip()
     status = str(payload.get("status", "unknown"))
@@ -315,88 +373,228 @@ def handle_async_done(payload):
         exit_code = 1
 
     if not is_safe_base_dir(base_dir):
-        log(f"async_done_skip reason=invalid_base_dir base_dir={base_dir} run_id={run_id} minion={minion_id}")
+        log(
+            f"async_done_skip reason=invalid_base_dir "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
+        return
+
+    if not is_safe_run_id(run_id):
+        log(
+            f"async_done_skip reason=invalid_run_id "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
         return
 
     if not is_safe_minion_id(minion_id):
-        log(f"async_done_skip reason=invalid_minion_id base_dir={base_dir} run_id={run_id} minion={minion_id}")
+        log(
+            f"async_done_skip reason=invalid_minion_id "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
         return
 
-    result_dir = os.path.join(base_dir, "result")
-    error_dir = os.path.join(base_dir, "error")
-    result_file = os.path.join(result_dir, minion_id)
-    error_file = os.path.join(error_dir, minion_id)
+    tmp_dir = os.path.join(base_dir, ".tmp")
+    pending_file = os.path.join(tmp_dir, "async_pending")
+    result_status_file = os.path.join(tmp_dir, "result_status")
+    cancel_marker = os.path.join(tmp_dir, "cancelled")
+    jid_registering_file = os.path.join(tmp_dir, "jid_registering")
 
-    os.makedirs(result_dir, exist_ok=True)
-    os.makedirs(error_dir, exist_ok=True)
+    # async_pending은 Salt submit 전에 생성될 수 있으므로 JID registry 기록이
+    # 끝나기 전에 event가 도착하면 jid_registering marker가 사라질 때까지 기다린다.
+    for _ in range(100):
+        if not os.path.exists(jid_registering_file):
+            break
 
-    wrote_result = False
-    wrote_error = False
+        time.sleep(0.1)
 
-    is_failed = exit_code != 0 or status != "success"
+    if os.path.exists(jid_registering_file):
+        log(
+            f"async_done_skip reason=jid_registering "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
+        return
 
-    # ============================================================
-    # 저장 정책
-    # ============================================================
-    # 1. stderr 가 있으면:
-    #    - stdout 은 result 에 저장
-    #    - stderr 는 error 에 저장
-    #
-    # 2. stderr 가 없고 실패이면:
-    #    - stdout 이 있으면 error 에만 저장
-    #    - stdout 도 없으면 빈 error 파일 생성
-    #
-    # 3. 성공이면:
-    #    - stdout 을 result 에 저장
-    #    - stdout 이 없어도 빈 result 파일 생성
-    #    - 기존 error 파일은 제거
-    # ============================================================
-    if stderr_content:
-        if stdout_content:
-            write_text_file(result_file, stdout_content)
-            wrote_result = True
+    if os.path.exists(cancel_marker):
+        log(
+            f"async_done_skip reason=cancelled "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
+        return
 
-        append_text_file(error_file, stderr_content)
-        wrote_error = True
+    if not os.path.isfile(pending_file):
+        log(
+            f"async_done_skip reason=no_async_pending "
+            f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+        )
+        return
 
-    elif is_failed:
-        if stdout_content:
-            append_text_file(error_file, stdout_content)
-        else:
-            append_text_file(error_file, "")
+    async_complete = False
+    keep_tmp = False
 
-        wrote_error = True
+    try:
+        with open(pending_file, "r+", encoding="utf-8") as pending_lock:
+            fcntl.flock(pending_lock.fileno(), fcntl.LOCK_EX)
 
-        try:
-            if os.path.exists(result_file):
-                os.remove(result_file)
-        except Exception:
-            pass
+            # lock을 기다리는 동안 다른 listener가 전체 완료 처리를 끝내고
+            # async_pending path를 제거했으면 중복 event이므로 종료한다.
+            if not os.path.exists(pending_file):
+                return
 
-    else:
-        write_text_file(result_file, stdout_content)
-        wrote_result = True
+            pending_lock.seek(0)
+            pending = parse_async_pending_line(pending_lock.readline())
 
-        # local의 file_deploy가 남긴 error/<host>는 remote 성공이어도 유지한다.
+            if pending is None:
+                log(
+                    f"async_done_skip reason=invalid_async_pending "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
 
-    # 성공/실패 여부와 관계없이 event를 받은 host는 완료 처리한다.
-    done_marker = os.path.join(
-        base_dir,
-        "log",
-        "async_done_hosts",
-        minion_id,
-    )
+            pending_run_id, expected_hosts, keep_tmp = pending
 
-    write_text_file(done_marker, "")
+            if pending_run_id != run_id:
+                log(
+                    f"async_done_skip reason=run_id_mismatch "
+                    f"base_dir={base_dir} "
+                    f"event_run_id={run_id} "
+                    f"pending_run_id={pending_run_id} "
+                    f"minion={minion_id}"
+                )
+                return
 
-    log(
-        f"async_result_written base_dir={base_dir} run_id={run_id} "
-        f"minion={minion_id} rc={exit_code} "
-        f"result={'yes' if wrote_result else 'no'} "
-        f"error={'yes' if wrote_error else 'no'}"
-    )
+            if minion_id not in set(expected_hosts):
+                log(
+                    f"async_done_skip reason=unexpected_minion "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
 
-    maybe_run_post(base_dir, run_id)
+            if os.path.exists(cancel_marker) or not os.path.exists(pending_file):
+                log(
+                    f"async_done_skip reason=cancelled_or_pending_removed "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
+
+            if minion_id in get_done_hosts(result_status_file):
+                log(
+                    f"async_done_skip reason=already_done "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
+
+            result_dir = os.path.join(base_dir, "result")
+            error_dir = os.path.join(base_dir, "error")
+            result_file = os.path.join(result_dir, minion_id)
+            error_file = os.path.join(error_dir, minion_id)
+
+            os.makedirs(result_dir, exist_ok=True)
+            os.makedirs(error_dir, exist_ok=True)
+
+            wrote_result = False
+            wrote_error = False
+            is_failed = exit_code != 0 or status != "success"
+
+            # ============================================================
+            # 저장 정책
+            # ============================================================
+            # 1. stderr가 있으면:
+            #    - stdout은 result에 저장
+            #    - stderr는 error에 저장
+            #
+            # 2. stderr가 없고 실패이면:
+            #    - stdout이 있으면 error에만 저장
+            #    - stdout도 없으면 빈 error 파일 생성
+            #
+            # 3. 성공이면:
+            #    - stdout을 result에 저장
+            #    - stdout이 없어도 빈 result 파일 생성
+            #    - local의 file_deploy가 남긴 기존 error 파일은 유지
+            # ============================================================
+            if stderr_content:
+                if stdout_content:
+                    write_text_file(result_file, stdout_content)
+                    wrote_result = True
+
+                append_text_file(error_file, stderr_content)
+                wrote_error = True
+
+            elif is_failed:
+                if stdout_content:
+                    append_text_file(error_file, stdout_content)
+                else:
+                    append_text_file(error_file, "")
+
+                wrote_error = True
+
+                try:
+                    if os.path.exists(result_file):
+                        os.remove(result_file)
+                except Exception:
+                    pass
+
+            else:
+                write_text_file(result_file, stdout_content)
+                wrote_result = True
+
+            log(
+                f"async_result_written base_dir={base_dir} run_id={run_id} "
+                f"minion={minion_id} rc={exit_code} "
+                f"result={'yes' if wrote_result else 'no'} "
+                f"error={'yes' if wrote_error else 'no'}"
+            )
+
+            # 결과 저장 중 Ctrl+C/TERM이 들어와 start.sh가 async_pending을
+            # 제거했으면 완료 marker와 post를 진행하지 않는다.
+            if os.path.exists(cancel_marker) or not os.path.exists(pending_file):
+                log(
+                    f"async_done_skip reason=cancelled_or_pending_removed "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
+
+            mark_done_host(result_status_file, minion_id)
+
+            if not all_async_hosts_done(expected_hosts, result_status_file):
+                return
+
+            # 마지막 host 완료 판정 후 post 실행 직전 취소 상태를 다시 확인한다.
+            if os.path.exists(cancel_marker) or not os.path.exists(pending_file):
+                log(
+                    f"post_skip reason=cancelled_or_pending_removed "
+                    f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
+                )
+                return
+
+            run_post_once(base_dir, run_id)
+
+            # async_pending 자체가 post 중복 실행 방지 marker다.
+            # lock을 가진 listener가 post를 끝낸 뒤 path를 제거한다.
+            try:
+                os.remove(pending_file)
+            except FileNotFoundError:
+                pass
+
+            async_complete = True
+
+    except FileNotFoundError:
+        return
+
+    except Exception as e:
+        log(
+            f"async_done_state_error "
+            f"base_dir={base_dir} run_id={run_id} "
+            f"minion={minion_id} error={e}"
+        )
+        return
+
+    if async_complete:
+        cleanup_async_tmp(
+            base_dir,
+            result_status_file,
+            keep_tmp,
+        )
+
 
 def main():
     opts = salt.config.client_config(MASTER_CONFIG)
@@ -455,10 +653,12 @@ def main():
             handle_async_done(payload)
             continue
 
-        log(f"event_skip reason=unsupported_event_type tag={tag} run_id={run_id} minion={minion_id}")
+        log(
+            f"event_skip reason=unsupported_event_type "
+            f"tag={tag} run_id={run_id} minion={minion_id}"
+        )
 
 
 if __name__ == "__main__":
     main()
-
 
