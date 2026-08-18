@@ -39,7 +39,7 @@
 - `salt_framework/start.sh`: 작업 디렉토리 결정, `config` 로드, 대상 서버 준비, 실행 전 검증을 담당합니다.
 - `salt_framework/salt_apply`: 실제 Salt 실행, JID 수집, 결과 분류를 담당합니다.
 - `salt_framework/salt_framework_event_notify.sh`: `ASYNC_RESULT=true`일 때 minion에서 실행 결과 event를 전송합니다.
-- `salt_framework/salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 marker 기준으로 완료되면 `post`를 실행합니다.
+- `salt_framework/salt_framework_event_listener.py`: master event bus를 감시해 async 결과를 `result/`, `error/`로 저장하고 `.tmp/result_status` 기준으로 전체 완료 시 `post`를 실행합니다.
 - `netbox_inventory/refresh_inventory.sh`: NetBox에서 VM/Device inventory를 갱신하고 pillar 및 accepted key cache 갱신 스크립트를 실행합니다.
 - `netbox_inventory/function`: NetBox inventory 기준으로 자주 쓰는 서버 목록 조회 함수를 제공합니다.
 - `netbox_inventory/pillar_make.sh`: `vm_inventory` 기준으로 `/srv/pillar`의 minion pillar 파일을 생성합니다.
@@ -77,7 +77,34 @@ CLI 옵션:
 | `--keep-tmp` | 종료 후 `.tmp` 디렉토리를 삭제하지 않습니다. 디버깅용입니다. |
 | `-d`, `--debug` | `log/debug.log` 기록과 터미널 debug 출력을 켭니다. |
 | `-i`, `--init <작업경로>` | `/data/salt/common/sample`을 복사해 새 작업 디렉토리를 만듭니다. |
+| `-j`, `--jid [JID\|all]` | 실행 중인 Sage/Salt JID 상태를 조회합니다. |
+| `-K`, `--kill-jid [JID]` | 실행 중인 Sage JID 또는 지정 JID를 중단합니다. |
 | `-h`, `--help` | 사용법을 출력합니다. |
+
+JID 조회:
+
+```bash
+# 현재 작업 경로의 실행 중 Sage JID 조회
+sage -j
+
+# 특정 JID 상태 조회
+sage -j 20260818010101000000
+
+# master 전체 실행 중 Salt JID 조회
+sage -j all
+```
+
+JID 중단:
+
+```bash
+# 현재 작업 경로의 실행 중 Sage JID 중단
+sage -K
+
+# 특정 JID 중단
+sage -K 20260818010101000000
+```
+
+`-j`, `-K`는 일반 실행 옵션이나 작업 경로와 같이 사용할 수 없습니다. `-K all`은 지원하지 않습니다.
 
 ## 작업 디렉토리 파일
 
@@ -255,10 +282,20 @@ ASYNC_RESULT/event 옵션:
 | `log/jid_registry` | 현재 Sage 실행에서 발급된 `main`, `chunk`, `file_deploy` JID 추적 파일입니다. 취소 처리도 이 파일 기준으로 수행합니다. |
 | `log/server_fail` | salt-key 미등록, ping 실패, dirty_nodes 제외 목록입니다. |
 | `log/debug.log` | debug 모드 로그입니다. |
-| `.tmp/async_pending` | `ASYNC_RESULT=true` 실행의 listener handoff 상태 파일입니다. 남아 있으면 이전 비동기 결과 수집이 아직 진행 중인 상태입니다. |
-| `.tmp/result_status` | JID missing/timeout 분류 및 `ASYNC_RESULT` 완료 host 상태 파일입니다. |
+| `.tmp/async_pending` | `ASYNC_RESULT=true` 실행의 listener handoff 상태 파일입니다. `run_id`, 대상 host, `keep_tmp`, JID를 저장합니다. |
+| `.tmp/result_status` | JID missing/timeout 분류 및 `ASYNC_RESULT` 완료 host 상태 파일입니다. ASYNC_RESULT에서는 host별 `ended_epoch`도 저장합니다. |
 | `result/<host>` | host별 정상 stdout 결과입니다. stdout이 없어도 성공이면 빈 파일이 생성될 수 있습니다. |
 | `error/<host>` | host별 stderr, 실패 stdout, `no_stderr`, timeout/미반환 분류 결과입니다. |
+
+전역 이력:
+
+| 경로 | 설명 |
+| --- | --- |
+| `/var/log/salt/sage_history.log` | Sage가 발급한 JID 이력입니다. JID 생성 시 CREATE 이력, 종료 시 FINAL 이력을 남깁니다. |
+
+`sage_history.log`는 `MAIN`, `JID_CHUNK`, `FILE_DEPLOY` 유형을 구분합니다. 같은 JID는 CREATE 1회, FINAL 1회만 기록합니다. FINAL의 `SALT_RC`는 정상 완료 `0`, 실패 `1`, `Ctrl+C`/`sage -K` 중단 `130`, `TERM` 중단 `143` 기준입니다.
+
+`ASYNC_RESULT=true`는 전체 async 결과 수집 완료 후 JID FINAL 기록, `post` 실행, `async_pending`/`.tmp` 정리 순서로 처리합니다. FINAL 시간은 전체 대상 중 가장 늦게 종료된 minion의 `ended_epoch` 기준입니다.
 
 ## 실행 취소
 
@@ -268,6 +305,8 @@ ASYNC_RESULT/event 옵션:
 - 취소 요청 이후에는 새 Salt JID를 추가 제출하지 않습니다.
 - JID 발급 직후 registry 기록 전 취소 누락을 막기 위해 짧은 보호구간을 둡니다.
 - `file_deploy` 취소 중 종료 상태를 확인하지 못한 minion이 있으면 staging 경로를 삭제하지 않고 유지합니다.
+- `sage -K`는 실제 `RUNNING` 상태를 확인한 뒤 `term_job`을 수행하고, 계속 실행 중이면 `kill_job` 후 다시 종료 상태를 확인합니다.
+- 현재 작업의 `ASYNC_RESULT` pending JID를 `sage -K <JID>`로 중단하면 현재 작업 중단 흐름으로 처리해 `.tmp` 정리까지 수행합니다.
 
 ## async result listener
 
@@ -279,7 +318,9 @@ systemctl status salt-framework-event.service
 
 listener는 `salt/framework/async/*` event를 감시합니다. payload의 `base_dir`이 `/data/salt/manual/`, `/data/salt/cron/`, `/data/salt/shared/` 아래가 아니면 무시합니다.
 
-`ASYNC_RESULT=true` 실행은 `.tmp/async_pending`을 listener handoff marker로 사용합니다. listener는 `.tmp/result_status`에 host별 `async_done` 상태를 기록하고, 전체 대상 event를 받은 뒤 `post`를 한 번만 실행합니다. 완료 후 `--keep-tmp`가 아니면 listener가 `.tmp` 상태 파일을 정리합니다.
+`ASYNC_RESULT=true` 실행은 `.tmp/async_pending`을 listener handoff marker로 사용합니다. listener는 `.tmp/result_status`에 host별 `async_done`과 `ended_epoch`를 기록하고, 전체 대상 event를 받은 뒤 `post`를 한 번만 실행합니다. 완료 후 `--keep-tmp`가 아니면 listener가 `.tmp` 상태 파일을 정리합니다.
+
+minion의 async event 전송이 재시도 후에도 실패하면 `salt_framework_event_notify.sh`가 실패 rc를 반환합니다.
 
 ## NetBox inventory
 
