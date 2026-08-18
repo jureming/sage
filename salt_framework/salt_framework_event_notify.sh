@@ -128,6 +128,7 @@ async_done_send_files() {
         "$exit_code" \
         "$FRAMEWORK_STARTED_AT" \
         "$ended_at" \
+        "$now_epoch" \
         "$duration_sec" \
         "$stdout_file" \
         "$stderr_file" <<'PYASYNC'
@@ -148,14 +149,20 @@ status = sys.argv[7]
 exit_code_raw = sys.argv[8]
 started_at = sys.argv[9]
 ended_at = sys.argv[10]
-duration_sec_raw = sys.argv[11]
-stdout_file = sys.argv[12]
-stderr_file = sys.argv[13]
+ended_epoch_raw = sys.argv[11]
+duration_sec_raw = sys.argv[12]
+stdout_file = sys.argv[13]
+stderr_file = sys.argv[14]
 
 try:
     exit_code = int(exit_code_raw)
 except Exception:
     exit_code = 1
+
+try:
+    ended_epoch = int(ended_epoch_raw)
+except Exception:
+    ended_epoch = 0
 
 try:
     duration_sec = int(duration_sec_raw)
@@ -184,6 +191,7 @@ data = {
     "exit_code": exit_code,
     "started_at": started_at,
     "ended_at": ended_at,
+    "ended_epoch": ended_epoch,
     "duration_sec": duration_sec,
     "stdout_content": stdout_content,
     "stderr_content": stderr_content,

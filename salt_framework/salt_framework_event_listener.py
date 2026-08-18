@@ -185,12 +185,13 @@ def post_has_effective_content(post_file):
 def parse_async_pending_line(line):
     parts = line.rstrip("\n").split("\t")
 
-    if len(parts) != 3:
+    if len(parts) != 4:
         return None
 
     pending_run_id = parts[0].strip()
     hosts_raw = parts[1].strip()
     keep_tmp_raw = parts[2].strip()
+    jid = parts[3].strip()
 
     expected_hosts = []
     seen = set()
@@ -202,12 +203,12 @@ def parse_async_pending_line(line):
             seen.add(host)
             expected_hosts.append(host)
 
-    if not pending_run_id or not expected_hosts:
+    if not pending_run_id or not expected_hosts or not jid.isdigit():
         return None
 
     keep_tmp = keep_tmp_raw in TRUE_VALUES
 
-    return pending_run_id, expected_hosts, keep_tmp
+    return pending_run_id, expected_hosts, keep_tmp, jid
 
 
 def get_done_hosts(result_status_file):
@@ -232,16 +233,120 @@ def get_done_hosts(result_status_file):
     return done
 
 
-def mark_done_host(result_status_file, minion_id):
+def mark_done_host(result_status_file, minion_id, ended_epoch):
     done_hosts = get_done_hosts(result_status_file)
 
     if minion_id in done_hosts:
         return
 
     with open(result_status_file, "a", encoding="utf-8") as f:
-        f.write(f"{minion_id}\tasync_done\n")
+        f.write(f"{minion_id}\tasync_done\t{ended_epoch}\n")
         f.flush()
         os.fsync(f.fileno())
+
+
+def get_async_last_ended_epoch(result_status_file):
+    last_ended_epoch = 0
+
+    try:
+        with open(result_status_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+
+                if len(parts) < 3 or parts[1].strip() != "async_done":
+                    continue
+
+                try:
+                    ended_epoch = int(parts[2].strip())
+                except Exception:
+                    continue
+
+                if ended_epoch > last_ended_epoch:
+                    last_ended_epoch = ended_epoch
+    except Exception:
+        pass
+
+    return last_ended_epoch
+
+
+def format_kst_epoch(epoch):
+    try:
+        epoch = int(epoch)
+    except Exception:
+        epoch = 0
+
+    if epoch <= 0:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    return time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.gmtime(epoch + (9 * 60 * 60)),
+    )
+
+
+def append_async_jid_history_final(
+    base_dir,
+    jid,
+    target_count,
+    final_rc,
+    history_time,
+):
+    history_dir = "/var/log/salt"
+    history_log = os.path.join(history_dir, "sage_history.log")
+    history_lock = history_log + ".lock"
+
+    if not str(jid).isdigit():
+        return False
+
+    try:
+        os.makedirs(history_dir, exist_ok=True)
+
+        with open(history_lock, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+            if os.path.exists(history_log):
+                with open(
+                    history_log,
+                    "r",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as f:
+                    for line in f:
+                        fields = line.rstrip("\n").split("\t")
+
+                        has_jid = any(
+                            field == f"JID: {jid}"
+                            for field in fields
+                        )
+                        has_rc = any(
+                            field.startswith("SALT_RC:")
+                            for field in fields
+                        )
+
+                        if has_jid and has_rc:
+                            return True
+
+            with open(history_log, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{history_time}\t"
+                    f"JOB: {base_dir}\t"
+                    f"TYPE: MAIN\t"
+                    f"LABEL: -\t"
+                    f"JID: {jid}\t"
+                    f"TARGETS: {target_count}\t"
+                    f"SALT_RC: {final_rc}\n"
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+        return True
+
+    except Exception as e:
+        log(
+            f"history_final_failed base_dir={base_dir} jid={jid} "
+            f"rc={final_rc} error={e}"
+        )
+        return False
 
 
 def run_post_once(base_dir, run_id):
@@ -357,6 +462,7 @@ def handle_async_done(payload):
     minion_id = str(payload.get("minion_id", "")).strip()
     status = str(payload.get("status", "unknown"))
     exit_code_raw = payload.get("exit_code", 1)
+    ended_epoch_raw = payload.get("ended_epoch", 0)
 
     stdout_content = payload.get("stdout_content", None)
     if stdout_content is None:
@@ -371,6 +477,11 @@ def handle_async_done(payload):
         exit_code = int(exit_code_raw)
     except Exception:
         exit_code = 1
+
+    try:
+        ended_epoch = int(ended_epoch_raw)
+    except Exception:
+        ended_epoch = 0
 
     if not is_safe_base_dir(base_dir):
         log(
@@ -450,7 +561,7 @@ def handle_async_done(payload):
                 )
                 return
 
-            pending_run_id, expected_hosts, keep_tmp = pending
+            pending_run_id, expected_hosts, keep_tmp, pending_jid = pending
 
             if pending_run_id != run_id:
                 log(
@@ -553,18 +664,42 @@ def handle_async_done(payload):
                 )
                 return
 
-            mark_done_host(result_status_file, minion_id)
+            mark_done_host(
+                result_status_file,
+                minion_id,
+                ended_epoch,
+            )
 
             if not all_async_hosts_done(expected_hosts, result_status_file):
                 return
 
-            # 마지막 host 완료 판정 후 post 실행 직전 취소 상태를 다시 확인한다.
+            # 마지막 host 완료 판정 후 history/post 처리 직전
+            # 취소 상태를 다시 확인한다.
             if os.path.exists(cancel_marker) or not os.path.exists(pending_file):
                 log(
                     f"post_skip reason=cancelled_or_pending_removed "
                     f"base_dir={base_dir} run_id={run_id} minion={minion_id}"
                 )
                 return
+
+            # 모든 대상 event가 정상 수집된 경우,
+            # 가장 마지막으로 종료된 minion의 실제 종료시각을 기준으로
+            # 해당 JID의 FINAL SALT_RC=0 history를 기록한다.
+            last_ended_epoch = get_async_last_ended_epoch(
+                result_status_file
+            )
+
+            completed_at = format_kst_epoch(
+                last_ended_epoch
+            )
+
+            append_async_jid_history_final(
+                base_dir,
+                pending_jid,
+                len(expected_hosts),
+                0,
+                completed_at,
+            )
 
             run_post_once(base_dir, run_id)
 

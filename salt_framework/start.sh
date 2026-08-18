@@ -10,6 +10,10 @@ AUTO_YES=0
 KEEP_TMP=0
 CLI_DEBUG=0
 INIT_MODE=0
+JID_QUERY_MODE=0
+JID_QUERY_VALUE=""
+JID_KILL_MODE=0
+JID_KILL_VALUE=""
 init_target=""
 
 # ============================================================
@@ -67,18 +71,43 @@ target_path="${SAGE_BASE_DIR:-}"
 # ============================================================
 print_usage() {
     cat <<'EOF'
-사용법: sage [-y|--yes] [--keep-tmp] [-d|--debug] [-i|--init <작업경로>] [작업경로]
+==========================================================================
+사용법
+==========================================================================
+
+  실행 : sage [실행옵션] [작업경로]
+  생성 : sage -i|--init <작업경로>
+  조회 : sage -j [JID|all]
+  중단 : sage -K [JID]
 
 경로를 생략하면 현재 디렉토리를 작업 디렉토리로 사용합니다.
 
-옵션:
+
+실행 옵션:
   -y, --yes            실행 확인 없이 바로 실행
   --keep-tmp           실행 종료 후 .tmp 디렉토리 유지
   -d, --debug          debug.log 기록 및 디버그 내용 화면 출력
+
+생성:
   -i, --init <경로>    sample을 복사해 작업 디렉토리 생성
+
+조회:
+  -j                   현재 작업 경로의 실행 중 Sage JID 조회
+  -j <JID>             지정한 JID의 현재 실행 상태 조회
+  -j all               master의 전체 실행 중 Salt JID 조회
+
+중단:
+  -K                   현재 작업 경로의 실행 중 Sage JID 중단
+  -K <JID>             지정한 JID 중단
+
+기타:
   -h, --help           도움말 출력
 
-config 주요 설정:
+
+==========================================================================
+config 주요 설정
+==========================================================================
+
   TIMEOUT                    Salt 명령 통신 timeout(초)
                              기본값: 3
 
@@ -123,6 +152,11 @@ config 주요 설정:
   FILE_DEPLOY_WAIT_TIMEOUT   file_deploy 결과 대기시간(초)
                              기본값: 7200
 
+
+==========================================================================
+실행 모드 조합
+==========================================================================
+
 사용 가능 조합:
   1. 일반 작업 · 권장
      별도 설정 없음
@@ -144,11 +178,13 @@ config 주요 설정:
 
      cmd.run + __RUN_SCRIPT__ 실행에서만 사용할 수 있습니다.
 
+
 사용 불가 조합:
   ASYNC_RESULT="true" + ASYNC="false"
   ASYNC_RESULT="true" + cmd.run/__RUN_SCRIPT__ 외 실행 방식
   JID_CHUNK_SIZE="양의 정수" + ASYNC="true"
   JID_CHUNK_SIZE="양의 정수" + COLLECT_BY_JID="false"
+
 
 참고:
   BATCH는 ASYNC="false" + COLLECT_BY_JID="false" 조합에서만 적용됩니다.
@@ -224,6 +260,1807 @@ init_job_dir() {
     echo "=========================================================================="
 }
 
+
+# ============================================================
+# Sage JID history
+#
+# history 규칙:
+#   SALT_RC 없음  : JID 생성
+#   SALT_RC=0     : 정상 완료
+#   SALT_RC=1     : 실패
+#   SALT_RC=130   : Ctrl+C / sage -K 취소
+#   SALT_RC=143   : SIGTERM 취소
+#
+# JID 하나당 CREATE 1줄 + FINAL 1줄까지만 기록한다.
+# CREATE 시간은 JID timestamp를 KST로 변환하고,
+# FINAL 시간은 상태가 확정된 시각을 사용한다.
+# ============================================================
+__sage_jid_history_time() {
+    local jid="${1:-}"
+    local jid_utc=""
+
+    if [[ "$jid" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
+        jid_utc="$(
+            printf '%s-%s-%s %s:%s:%s UTC' \
+                "${BASH_REMATCH[1]}" \
+                "${BASH_REMATCH[2]}" \
+                "${BASH_REMATCH[3]}" \
+                "${BASH_REMATCH[4]}" \
+                "${BASH_REMATCH[5]}" \
+                "${BASH_REMATCH[6]}"
+        )"
+
+        TZ=Asia/Seoul date -d "$jid_utc" '+%F %T' 2>/dev/null && return 0
+    fi
+
+    date '+%F %T'
+}
+
+append_sage_jid_history() {
+    local jid="${1:-}"
+    local context="${2:-}"
+    local label="${3:-}"
+    local target_count="${4:-unknown}"
+    local rc="${5:-}"
+    local history_time="${6:-}"
+    local history_job="${7:-${SAGE_JOB_DIR:-${base_dir:-$(pwd -P)}}}"
+
+    local history_dir="/var/log/salt"
+    local history_log="$history_dir/sage_history.log"
+    local history_lock="${history_log}.lock"
+    local history_type=""
+    local record_kind="create"
+
+    [[ "$jid" =~ ^[0-9]+$ ]] || return 0
+
+    if [[ -z "$context" ]]; then
+        if [[ "${SALT_APPLY_CONTEXT:-default}" == "file_deploy" ]]; then
+            context="file_deploy"
+            label="${SAGE_FILE_DEPLOY_LABEL:-0000}:${JID_CHUNK_LABEL:-0/0}"
+        elif [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
+            context="chunk"
+            label="${JID_CHUNK_LABEL:-0/0}"
+        else
+            context="main"
+            label="-"
+        fi
+    fi
+
+    case "$context" in
+        file_deploy)
+            history_type="FILE_DEPLOY"
+            ;;
+        chunk)
+            history_type="JID_CHUNK"
+            ;;
+        main)
+            history_type="MAIN"
+            label="-"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    [[ -n "$label" ]] || label="-"
+    [[ -n "$target_count" ]] || target_count="unknown"
+
+    if [[ -n "$rc" ]]; then
+        record_kind="final"
+    fi
+
+    if [[ -z "$history_time" ]]; then
+        if [[ "$record_kind" == "create" ]]; then
+            history_time="$(__sage_jid_history_time "$jid")"
+        else
+            history_time="$(date '+%F %T')"
+        fi
+    fi
+
+    mkdir -p "$history_dir" 2>/dev/null || return 0
+
+    (
+        flock -x 200
+
+        # 같은 JID의 CREATE/FINAL은 각각 한 번만 기록한다.
+        if [[ -s "$history_log" ]] &&
+            awk -F '\t' \
+                -v target_jid="JID: $jid" \
+                -v record_kind="$record_kind" '
+                    {
+                        has_jid = 0
+                        has_rc = 0
+
+                        for (i = 1; i <= NF; i++) {
+                            if ($i == target_jid) {
+                                has_jid = 1
+                            }
+
+                            if ($i ~ /^SALT_RC:[[:space:]]*/) {
+                                has_rc = 1
+                            }
+                        }
+
+                        if (has_jid) {
+                            if (record_kind == "create" && !has_rc) {
+                                found = 1
+                            }
+
+                            if (record_kind == "final" && has_rc) {
+                                found = 1
+                            }
+                        }
+                    }
+
+                    END {
+                        exit(found ? 0 : 1)
+                    }
+                ' "$history_log"
+        then
+            exit 0
+        fi
+
+        if [[ "$record_kind" == "create" ]]; then
+            printf '%s\tJOB: %s\tTYPE: %s\tLABEL: %s\tJID: %s\tTARGETS: %s\n' \
+                "$history_time" \
+                "$history_job" \
+                "$history_type" \
+                "$label" \
+                "$jid" \
+                "$target_count" \
+                >> "$history_log"
+        else
+            printf '%s\tJOB: %s\tTYPE: %s\tLABEL: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
+                "$history_time" \
+                "$history_job" \
+                "$history_type" \
+                "$label" \
+                "$jid" \
+                "$target_count" \
+                "$rc" \
+                >> "$history_log"
+        fi
+    ) 200>"$history_lock" 2>/dev/null || true
+
+    return 0
+}
+
+# ============================================================
+# JID 실행 상태 조회 (-j / --jid)
+# ============================================================
+# 조회 모드는 일반 Sage 실행과 완전히 분리한다.
+# config/pre/server/ping/.run.lock을 읽거나 생성하지 않는다.
+#
+#   sage -j
+#     현재 작업 디렉토리의 log/jid_registry에 기록된 JID만 대상으로
+#     saltutil.find_job을 실행하여 현재 실행 중인 Sage JID를 출력한다.
+#
+#   sage -j <JID>
+#     현재 디렉토리의 jid_registry에 해당 JID가 있으면 그 대상만 조회하고,
+#     없으면 master job cache(jobs.list_job)에서 대상 minion을 확인한 뒤
+#     해당 대상에게만 saltutil.find_job을 실행한다.
+#
+# jobs.active는 모든 minion의 saltutil.running을 조회하므로 사용하지 않는다.
+# JID는 숫자로 변환하지 않고 문자열 그대로 처리한다.
+# ============================================================
+resolve_salt_bin_for_jid_query() {
+    local bin="${SALT_BIN:-}"
+
+    if [[ -n "$bin" && -x "$bin" ]]; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    if [[ -x /usr/bin/salt ]]; then
+        printf '%s\n' "/usr/bin/salt"
+        return 0
+    fi
+
+    bin="$(command -v salt 2>/dev/null || true)"
+
+    if [[ -n "$bin" && -x "$bin" ]]; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_salt_run_bin_for_jid_query() {
+    local bin="${SALT_RUN_BIN:-}"
+
+    if [[ -n "$bin" && -x "$bin" ]]; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    if [[ -x /usr/bin/salt-run ]]; then
+        printf '%s\n' "/usr/bin/salt-run"
+        return 0
+    fi
+
+    bin="$(command -v salt-run 2>/dev/null || true)"
+
+    if [[ -n "$bin" && -x "$bin" ]]; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    return 1
+}
+
+jid_query_targets_to_file() {
+    local targets="$1"
+    local output_file="$2"
+
+    printf '%s\n' "$targets" \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | sed '/^$/d' \
+        | sort -u \
+        > "$output_file"
+}
+
+jid_query_json_keys() {
+    local json_file="$1"
+    local mode="$2"
+
+    python3 - "$json_file" "$mode" <<'PY_JID_FIND_KEYS'
+import json
+import sys
+
+path = sys.argv[1]
+mode = sys.argv[2]
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+for host, value in data.items():
+    # saltutil.find_job 정상 응답:
+    #   {}        = 해당 JID가 현재 실행 중이 아님
+    #   non-empty = 해당 JID가 현재 실행 중
+    # timeout/error 문자열 등은 정상 상태 응답으로 보지 않는다.
+    if mode == "responded":
+        if isinstance(value, dict):
+            print(host)
+    elif mode == "active":
+        if isinstance(value, dict) and value:
+            print(host)
+PY_JID_FIND_KEYS
+}
+
+jid_query_find_state() {
+    local jid="$1"
+    local targets="$2"
+    local state_dir="$3"
+
+    local salt_bin=""
+    local timeout_bin=""
+    local salt_timeout="${JID_QUERY_SALT_TIMEOUT:-3}"
+    local hard_timeout="${JID_QUERY_HARD_TIMEOUT:-15}"
+    local chunk_size="${JID_QUERY_TARGET_CHUNK_SIZE:-200}"
+    local expected_file="$state_dir/expected"
+    local responded_file="$state_dir/responded"
+    local active_file="$state_dir/active"
+    local inactive_file="$state_dir/inactive"
+    local unknown_file="$state_dir/unknown"
+    local chunk_dir="$state_dir/chunks"
+    local chunk_file=""
+    local chunk_targets=""
+    local json_file=""
+    local err_file=""
+    local rc=0
+
+    if [[ ! "$salt_timeout" =~ ^[0-9]+$ ]] || (( salt_timeout < 1 )); then
+        echo "JID_QUERY_SALT_TIMEOUT 값이 올바르지 않습니다: $salt_timeout" >&2
+        return 1
+    fi
+
+    if [[ ! "$hard_timeout" =~ ^[0-9]+$ ]] || (( hard_timeout < 1 )); then
+        echo "JID_QUERY_HARD_TIMEOUT 값이 올바르지 않습니다: $hard_timeout" >&2
+        return 1
+    fi
+
+    if [[ ! "$chunk_size" =~ ^[0-9]+$ ]] || (( chunk_size < 1 )); then
+        echo "JID_QUERY_TARGET_CHUNK_SIZE 값이 올바르지 않습니다: $chunk_size" >&2
+        return 1
+    fi
+
+    if ! salt_bin="$(resolve_salt_bin_for_jid_query)"; then
+        echo "salt 명령을 찾을 수 없습니다." >&2
+        return 1
+    fi
+
+    timeout_bin="$(command -v timeout 2>/dev/null || true)"
+
+    rm -rf "$state_dir"
+    mkdir -p "$state_dir" "$chunk_dir"
+
+    jid_query_targets_to_file "$targets" "$expected_file"
+
+    : > "$responded_file"
+    : > "$active_file"
+    : > "$inactive_file"
+    : > "$unknown_file"
+
+    if [[ ! -s "$expected_file" ]]; then
+        return 0
+    fi
+
+    split -d -a 5 -l "$chunk_size" "$expected_file" "$chunk_dir/chunk_"
+
+    for chunk_file in "$chunk_dir"/chunk_*; do
+        [[ -s "$chunk_file" ]] || continue
+
+        chunk_targets="$(paste -sd, "$chunk_file")"
+        json_file="${chunk_file}.json"
+        err_file="${chunk_file}.err"
+
+        set +e
+        if [[ -n "$timeout_bin" ]]; then
+            "$timeout_bin" \
+                --signal=TERM \
+                --kill-after=2 \
+                "${hard_timeout}s" \
+                "$salt_bin" \
+                -t "$salt_timeout" \
+                --out=json \
+                --static \
+                -L "$chunk_targets" \
+                saltutil.find_job "$jid" \
+                > "$json_file" \
+                2> "$err_file"
+            rc=$?
+        else
+            "$salt_bin" \
+                -t "$salt_timeout" \
+                --out=json \
+                --static \
+                -L "$chunk_targets" \
+                saltutil.find_job "$jid" \
+                > "$json_file" \
+                2> "$err_file"
+            rc=$?
+        fi
+        set -e
+
+        # Salt CLI rc가 비정상이어도 정상 JSON으로 돌아온 minion은 살린다.
+        if jid_query_json_keys "$json_file" responded >> "$responded_file" 2>/dev/null; then
+            jid_query_json_keys "$json_file" active >> "$active_file" 2>/dev/null || true
+        fi
+
+        : "$rc"
+    done
+
+    sort -u -o "$responded_file" "$responded_file"
+    sort -u -o "$active_file" "$active_file"
+
+    comm -23 "$responded_file" "$active_file" > "$inactive_file"
+    comm -23 "$expected_file" "$responded_file" > "$unknown_file"
+
+    return 0
+}
+
+jid_query_get_registry_record() {
+    local registry_file="$1"
+    local target_jid="$2"
+
+    [[ -s "$registry_file" ]] || return 1
+
+    awk -F '\t' -v target_jid="$target_jid" '
+        ($4 "") == (target_jid "") && $4 ~ /^[0-9]+$/ && $6 != "" {
+            print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6
+            exit
+        }
+    ' "$registry_file"
+}
+
+jid_query_get_job_cache_info() {
+    local jid="$1"
+    local output_file="$2"
+    local error_file="$3"
+    local salt_run_bin=""
+    local timeout_bin=""
+    local hard_timeout="${JID_QUERY_RUNNER_HARD_TIMEOUT:-15}"
+    local rc=0
+
+    if [[ ! "$hard_timeout" =~ ^[0-9]+$ ]] || (( hard_timeout < 1 )); then
+        echo "JID_QUERY_RUNNER_HARD_TIMEOUT 값이 올바르지 않습니다: $hard_timeout" >&2
+        return 1
+    fi
+
+    if ! salt_run_bin="$(resolve_salt_run_bin_for_jid_query)"; then
+        echo "salt-run 명령을 찾을 수 없습니다." >&2
+        return 1
+    fi
+
+    timeout_bin="$(command -v timeout 2>/dev/null || true)"
+
+    set +e
+    if [[ -n "$timeout_bin" ]]; then
+        "$timeout_bin" \
+            --signal=TERM \
+            --kill-after=2 \
+            "${hard_timeout}s" \
+            "$salt_run_bin" jobs.list_job "$jid" --out=json \
+            > "$output_file" \
+            2> "$error_file"
+        rc=$?
+    else
+        "$salt_run_bin" jobs.list_job "$jid" --out=json \
+            > "$output_file" \
+            2> "$error_file"
+        rc=$?
+    fi
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo "JID 정보 조회 실패: salt-run jobs.list_job rc=$rc" >&2
+        if [[ -s "$error_file" ]]; then
+            sed 's/^/  /' "$error_file" >&2
+        fi
+        return 1
+    fi
+
+    return 0
+}
+
+jid_query_parse_job_cache_info() {
+    local cache_json="$1"
+
+    python3 - "$cache_json" <<'PY_JID_CACHE'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+if isinstance(data, dict) and "return" in data and len(data) == 1 and isinstance(data["return"], dict):
+    data = data["return"]
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+if data.get("Error"):
+    sys.exit(2)
+
+function = data.get("Function", "")
+target_type = str(data.get("Target-type", "list") or "list")
+minions = data.get("Minions", [])
+target = data.get("Target", "")
+
+hosts = []
+seen = set()
+
+def add(value):
+    value = str(value).strip()
+    if value and value not in seen:
+        seen.add(value)
+        hosts.append(value)
+
+if isinstance(minions, (list, tuple)):
+    for item in minions:
+        add(item)
+
+# Sage가 발급한 JID는 -L list target이므로 Minions가 없을 때
+# Target-type=list의 Target을 안전한 fallback으로 사용한다.
+if not hosts and target_type == "list":
+    if isinstance(target, str):
+        for item in target.split(","):
+            add(item)
+    elif isinstance(target, (list, tuple)):
+        for item in target:
+            add(item)
+
+if not hosts:
+    sys.exit(3)
+
+print(str(function).replace("\t", " ").replace("\n", " "))
+print(",".join(hosts))
+PY_JID_CACHE
+}
+
+jid_query_format_type() {
+    local context="$1"
+
+    case "$context" in
+        main) printf '%s\n' "MAIN" ;;
+        chunk) printf '%s\n' "JID_CHUNK" ;;
+        file_deploy) printf '%s\n' "FILE_DEPLOY" ;;
+        *) printf '%s\n' "${context^^}" ;;
+    esac
+}
+
+jid_query_get_history_record() {
+    local jid="$1"
+    local history_log="/var/log/salt/sage_history.log"
+
+    [[ -s "$history_log" ]] || return 1
+
+    awk -F '\t' -v target_jid="JID: $jid" '
+        {
+            has_jid = 0
+            job = ""
+            type = ""
+            label = ""
+            targets = ""
+            rc = ""
+
+            for (i = 1; i <= NF; i++) {
+                if ($i == target_jid) {
+                    has_jid = 1
+                } else if ($i ~ /^JOB:[[:space:]]*/) {
+                    job = $i
+                    sub(/^JOB:[[:space:]]*/, "", job)
+                } else if ($i ~ /^TYPE:[[:space:]]*/) {
+                    type = $i
+                    sub(/^TYPE:[[:space:]]*/, "", type)
+                } else if ($i ~ /^LABEL:[[:space:]]*/) {
+                    label = $i
+                    sub(/^LABEL:[[:space:]]*/, "", label)
+                } else if ($i ~ /^TARGETS:[[:space:]]*/) {
+                    targets = $i
+                    sub(/^TARGETS:[[:space:]]*/, "", targets)
+                } else if ($i ~ /^SALT_RC:[[:space:]]*/) {
+                    rc = $i
+                    sub(/^SALT_RC:[[:space:]]*/, "", rc)
+                }
+            }
+            if (has_jid) {
+                matched = job "\t" type "\t" label "\t" targets "\t" rc
+            }
+        }
+
+        END {
+            if (matched != "") {
+                print matched
+            } else {
+                exit 1
+            }
+        }
+    ' "$history_log"
+}
+
+jid_query_specific() {
+    local jid="$1"
+    local work_dir="$2"
+    local current_registry="$(pwd -P)/log/jid_registry"
+    local registry_record=""
+    local history_record=""
+    local context=""
+    local label="-"
+    local target_count="?"
+    local targets=""
+    local function=""
+    local job="-"
+    local type_name="-"
+    local history_type=""
+    local history_label=""
+    local history_targets=""
+    local history_rc=""
+    local cache_json="$work_dir/job_cache.json"
+    local cache_err="$work_dir/job_cache.err"
+    local -a cache_info=()
+    local cache_info_file="$work_dir/cache_info"
+    local state_dir="$work_dir/state"
+    local active_count=0
+    local unknown_count=0
+    local cache_parse_rc=0
+
+    # --------------------------------------------------------
+    # 현재 작업 디렉토리의 jid_registry에서 먼저 조회
+    # --------------------------------------------------------
+    registry_record="$(
+        jid_query_get_registry_record \
+            "$current_registry" \
+            "$jid" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$registry_record" ]]; then
+        IFS=$'\t' read -r \
+            context \
+            label \
+            _jid \
+            target_count \
+            targets <<< "$registry_record"
+
+        job="$(pwd -P)"
+        type_name="$(jid_query_format_type "$context")"
+
+    else
+        # ----------------------------------------------------
+        # 현재 작업의 registry에 없으면 master job cache 조회
+        # ----------------------------------------------------
+        if ! jid_query_get_job_cache_info \
+            "$jid" \
+            "$cache_json" \
+            "$cache_err"
+        then
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+        fi
+
+        set +e
+        jid_query_parse_job_cache_info \
+            "$cache_json" \
+            > "$cache_info_file"
+        cache_parse_rc=$?
+        set -e
+
+        if [[ "$cache_parse_rc" -eq 0 ]]; then
+            mapfile -t cache_info < "$cache_info_file"
+        fi
+
+        # job cache에 없으면 현재 실행 중인 JID가 아님
+        if [[ "$cache_parse_rc" -eq 2 ]]; then
+            echo "실행 중인 JID가 아닙니다: $jid"
+            return 0
+        fi
+
+        if [[ "$cache_parse_rc" -ne 0 || ${#cache_info[@]} -lt 2 ]]; then
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+        fi
+
+        function="${cache_info[0]}"
+        targets="${cache_info[1]}"
+
+        target_count="$(
+            printf '%s\n' "$targets" \
+                | tr ',' '\n' \
+                | sed '/^$/d' \
+                | sort -u \
+                | wc -l
+        )"
+    fi
+
+    # --------------------------------------------------------
+    # sage_history에서 JOB / TYPE / LABEL / TARGETS 보강
+    # --------------------------------------------------------
+    history_record="$(
+        jid_query_get_history_record \
+            "$jid" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$history_record" ]]; then
+        IFS=$'\t' read -r \
+            job \
+            history_type \
+            history_label \
+            history_targets \
+            history_rc <<< "$history_record"
+
+        if [[ -n "$history_type" ]]; then
+            type_name="$history_type"
+        fi
+
+        if [[ -n "$history_label" ]]; then
+            label="$history_label"
+        fi
+
+        if [[ "$history_targets" =~ ^[0-9]+$ ]]; then
+            target_count="$history_targets"
+        fi
+    fi
+
+    # --------------------------------------------------------
+    # 실제 minion에서 해당 JID 실행 상태 조회
+    # --------------------------------------------------------
+    if ! jid_query_find_state \
+        "$jid" \
+        "$targets" \
+        "$state_dir"
+    then
+        echo "JID 상태를 확인할 수 없습니다: $jid"
+        return 1
+    fi
+
+    active_count="$(wc -l < "$state_dir/active")"
+    unknown_count="$(wc -l < "$state_dir/unknown")"
+
+    # --------------------------------------------------------
+    # 실행 중
+    # --------------------------------------------------------
+    if (( active_count > 0 )); then
+        printf 'JID      : %s\n' "$jid"
+        printf 'JOB      : %s\n' "$job"
+        printf 'TYPE     : %s\n' "$type_name"
+
+        if [[ "${label:--}" != "-" ]]; then
+            printf 'LABEL    : %s\n' "$label"
+        fi
+
+        if [[ -n "$function" ]]; then
+            printf 'FUNCTION : %s\n' "$function"
+        fi
+
+        echo "STATUS   : RUNNING"
+        printf 'RUNNING  : %s대\n' "$active_count"
+
+        if [[ "$target_count" =~ ^[0-9]+$ ]]; then
+            printf 'TARGETS  : %s대\n' "$target_count"
+        fi
+
+        if (( unknown_count > 0 )); then
+            printf 'UNKNOWN  : %s대\n' "$unknown_count"
+        fi
+
+        return 0
+    fi
+
+    # --------------------------------------------------------
+    # 실행 중인 host는 없지만 일부 host 상태 확인 실패
+    # --------------------------------------------------------
+    if (( unknown_count > 0 )); then
+        echo "JID 상태를 확인할 수 없습니다: $jid"
+        return 1
+    fi
+
+    # --------------------------------------------------------
+    # 전체 대상에서 find_job={} 확인 → 실행 종료
+    # --------------------------------------------------------
+    echo "실행 중인 JID가 아닙니다: $jid"
+    return 0
+}
+
+jid_query_current_job() {
+    local work_dir="$1"
+    local job_dir="$(pwd -P)"
+    local registry_file="$job_dir/log/jid_registry"
+    local records_file="$work_dir/registry_records"
+    local history_record=""
+    local context=""
+    local label=""
+    local jid=""
+    local target_count=""
+    local targets=""
+    local state_dir=""
+    local active_count=0
+    local unknown_count=0
+    local running_jid_count=0
+    local unknown_jid_count=0
+    local type_name=""
+    local job="$job_dir"
+    local history_type=""
+    local history_label=""
+    local history_targets=""
+    local history_rc=""
+
+    if [[ ! -s "$registry_file" ]]; then
+        echo "현재 작업 디렉토리에 조회할 Sage JID가 없습니다."
+        echo "확인 경로: $registry_file"
+        return 0
+    fi
+
+    awk -F '\t' '
+        $4 ~ /^[0-9]+$/ && $6 != "" && !seen[$4]++ {
+            print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6
+        }
+    ' "$registry_file" > "$records_file"
+
+    if [[ ! -s "$records_file" ]]; then
+        echo "현재 작업 디렉토리에 유효한 Sage JID가 없습니다."
+        return 0
+    fi
+
+    while IFS=$'\t' read -r context label jid target_count targets; do
+        [[ "$jid" =~ ^[0-9]+$ ]] || continue
+        [[ -n "$targets" ]] || continue
+
+        state_dir="$work_dir/state_$jid"
+
+        if ! jid_query_find_state "$jid" "$targets" "$state_dir"; then
+            unknown_jid_count=$((unknown_jid_count + 1))
+            continue
+        fi
+
+        active_count="$(wc -l < "$state_dir/active")"
+        unknown_count="$(wc -l < "$state_dir/unknown")"
+
+        # 실행 중이 아닌 JID는 출력하지 않는다.
+        if (( active_count == 0 )); then
+            if (( unknown_count > 0 )); then
+                unknown_jid_count=$((unknown_jid_count + 1))
+            fi
+            continue
+        fi
+
+        job="$job_dir"
+        type_name="$(jid_query_format_type "$context")"
+
+        history_record="$(jid_query_get_history_record "$jid" 2>/dev/null || true)"
+
+        if [[ -n "$history_record" ]]; then
+            IFS=$'\t' read -r \
+                job \
+                history_type \
+                history_label \
+                history_targets \
+                history_rc <<< "$history_record"
+
+            [[ -n "$history_type" ]] && type_name="$history_type"
+            [[ -n "$history_label" ]] && label="$history_label"
+
+            if [[ "$history_targets" =~ ^[0-9]+$ ]]; then
+                target_count="$history_targets"
+            fi
+        fi
+
+        if (( running_jid_count == 0 )); then
+            echo "[ 실행 중인 Sage JID ]"
+            echo
+        else
+            echo
+        fi
+
+        running_jid_count=$((running_jid_count + 1))
+
+        printf 'JID      : %s\n' "$jid"
+        printf 'JOB      : %s\n' "$job"
+        printf 'TYPE     : %s\n' "$type_name"
+
+        if [[ "${label:--}" != "-" ]]; then
+            printf 'LABEL    : %s\n' "$label"
+        fi
+
+        echo "STATUS   : RUNNING"
+        printf 'RUNNING  : %s대\n' "$active_count"
+        printf 'TARGETS  : %s대\n' "${target_count:-?}"
+
+        if (( unknown_count > 0 )); then
+            printf 'UNKNOWN  : %s대\n' "$unknown_count"
+        fi
+
+    done < "$records_file"
+
+    if (( running_jid_count == 0 )); then
+        echo "실행 중인 Sage JID가 없습니다."
+    else
+        echo
+        printf '실행 중 JID : %s개\n' "$running_jid_count"
+    fi
+
+    if (( unknown_jid_count > 0 )); then
+        printf '상태 미확인 JID : %s개\n' "$unknown_jid_count"
+    fi
+
+    return 0
+}
+
+jid_query_all_active() {
+    local work_dir="$1"
+    local salt_run_bin=""
+    local timeout_bin=""
+    local hard_timeout="${JID_QUERY_RUNNER_HARD_TIMEOUT:-15}"
+    local output_file="$work_dir/jobs_active.json"
+    local error_file="$work_dir/jobs_active.err"
+    local history_log="/var/log/salt/sage_history.log"
+    local rc=0
+    local parse_rc=0
+
+    if [[ ! "$hard_timeout" =~ ^[0-9]+$ ]] || (( hard_timeout < 1 )); then
+        echo "JID_QUERY_RUNNER_HARD_TIMEOUT 값이 올바르지 않습니다: $hard_timeout" >&2
+        return 1
+    fi
+
+    if ! salt_run_bin="$(resolve_salt_run_bin_for_jid_query)"; then
+        echo "salt-run 명령을 찾을 수 없습니다." >&2
+        return 1
+    fi
+
+    timeout_bin="$(command -v timeout 2>/dev/null || true)"
+
+    set +e
+    if [[ -n "$timeout_bin" ]]; then
+        "$timeout_bin" \
+            --signal=TERM \
+            --kill-after=2 \
+            "${hard_timeout}s" \
+            "$salt_run_bin" jobs.active --out=json \
+            > "$output_file" \
+            2> "$error_file"
+        rc=$?
+    else
+        "$salt_run_bin" jobs.active --out=json \
+            > "$output_file" \
+            2> "$error_file"
+        rc=$?
+    fi
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo "전체 JID 조회 실패: salt-run jobs.active rc=$rc" >&2
+        if [[ -s "$error_file" ]]; then
+            sed 's/^/  /' "$error_file" >&2
+        fi
+        return 1
+    fi
+
+    set +e
+    python3 - "$output_file" "$history_log" <<'PY_JID_ACTIVE_ALL'
+import json
+import re
+import sys
+
+jobs_path = sys.argv[1]
+history_path = sys.argv[2]
+
+try:
+    with open(jobs_path, "r", encoding="utf-8", errors="replace") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+if (
+    isinstance(data, dict)
+    and set(data.keys()) == {"return"}
+    and isinstance(data["return"], dict)
+):
+    data = data["return"]
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+history = {}
+
+history_pattern = re.compile(
+    r"JOB:\s*(.*?)\s+"
+    r"TYPE:\s*(.*?)\s+"
+    r"LABEL:\s*(.*?)\s+"
+    r"JID:\s*(\d+)\s+"
+    r"TARGETS:\s*(\S+)"
+    r"(?:\s+SALT_RC:\s*(\S+))?"
+)
+
+try:
+    with open(history_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = history_pattern.search(line.rstrip("\n"))
+
+            if not match:
+                continue
+
+            job, job_type, label, jid, targets, _rc = match.groups()
+
+            history[jid] = {
+                "job": job,
+                "type": job_type,
+                "label": label,
+                "targets": targets,
+            }
+except Exception:
+    pass
+
+jobs = []
+
+for jid, info in data.items():
+    jid = str(jid).strip()
+
+    if not jid.isdigit() or not isinstance(info, dict):
+        continue
+
+    running = info.get("Running", {})
+
+    if isinstance(running, dict):
+        running_count = len(running)
+    elif isinstance(running, (list, tuple, set)):
+        running_count = len(running)
+    elif running in (None, ""):
+        running_count = 0
+    else:
+        running_count = 1
+
+    if running_count <= 0:
+        continue
+
+    function = (
+        str(info.get("Function", "-") or "-")
+        .replace("\n", " ")
+        .replace("\t", " ")
+    )
+
+    hist = history.get(jid, {})
+
+    job = hist.get("job", "-")
+    job_type = hist.get("type", "-")
+    label = hist.get("label", "-")
+    target_count = hist.get("targets", "")
+
+    if not str(target_count).isdigit():
+        target = info.get("Target", "")
+        target_type = str(info.get("Target-type", "") or "")
+        target_items = []
+
+        if target_type == "list":
+            if isinstance(target, str):
+                target_items = [
+                    item.strip()
+                    for item in target.split(",")
+                    if item.strip()
+                ]
+            elif isinstance(target, (list, tuple)):
+                target_items = [
+                    str(item).strip()
+                    for item in target
+                    if str(item).strip()
+                ]
+
+        target_count = len(target_items) if target_items else ""
+
+    jobs.append(
+        (
+            jid,
+            job,
+            job_type,
+            label,
+            function,
+            running_count,
+            target_count,
+        )
+    )
+
+if not jobs:
+    print("실행 중인 Salt JID가 없습니다.")
+    sys.exit(0)
+
+jobs.sort(key=lambda item: item[0], reverse=True)
+
+print("[ 실행 중인 전체 Salt JID ]")
+
+for (
+    jid,
+    job,
+    job_type,
+    label,
+    function,
+    running_count,
+    target_count,
+) in jobs:
+    print()
+    print(f"JID      : {jid}")
+    print(f"JOB      : {job}")
+    print(f"TYPE     : {job_type}")
+
+    if label != "-":
+        print(f"LABEL    : {label}")
+
+    print(f"FUNCTION : {function}")
+    print(f"RUNNING  : {running_count}대")
+
+    if str(target_count).isdigit():
+        print(f"TARGETS  : {target_count}대")
+
+print()
+print(f"실행 중 JID : {len(jobs)}개")
+PY_JID_ACTIVE_ALL
+
+    parse_rc=$?
+    set -e
+
+    if [[ "$parse_rc" -ne 0 ]]; then
+        echo "전체 JID 조회 결과를 해석할 수 없습니다." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+run_jid_query_mode() {
+    local jid="${1:-}"
+    local work_dir=""
+    local rc=0
+
+    work_dir="$(mktemp -d /tmp/sage_jid_query.XXXXXX)"
+
+    set +e
+    if [[ "$jid" == "all" ]]; then
+        jid_query_all_active "$work_dir"
+        rc=$?
+    elif [[ -n "$jid" ]]; then
+        jid_query_specific "$jid" "$work_dir"
+        rc=$?
+    else
+        jid_query_current_job "$work_dir"
+        rc=$?
+    fi
+    set -e
+
+    rm -rf -- "$work_dir"
+    return "$rc"
+}
+
+# ============================================================
+# JID 강제 중단 (-K / --kill-jid)
+# ============================================================
+
+jid_kill_run_lock_held() {
+    local lock_file="$1"
+    local fd=""
+
+    [[ -e "$lock_file" ]] || return 1
+
+    exec {fd}<>"$lock_file" || return 1
+
+    if flock -n "$fd"; then
+        flock -u "$fd" 2>/dev/null || true
+        exec {fd}>&-
+        return 1
+    fi
+
+    exec {fd}>&-
+    return 0
+}
+
+
+jid_kill_signal_hosts() {
+    local jid="$1"
+    local host_file="$2"
+    local function_name="$3"
+    local work_dir="$4"
+
+    local salt_bin=""
+    local timeout_bin=""
+    local salt_timeout="${CANCEL_SALT_TIMEOUT:-2}"
+    local hard_timeout="${CANCEL_COMMAND_HARD_TIMEOUT:-8}"
+    local chunk_size="${CANCEL_TARGET_CHUNK_SIZE:-200}"
+
+    local chunk_dir="$work_dir/${function_name}"
+    local chunk_file=""
+    local chunk_targets=""
+    local rc=0
+
+    [[ -s "$host_file" ]] || return 0
+
+    if ! salt_bin="$(resolve_salt_bin_for_jid_query)"; then
+        echo "salt 명령을 찾을 수 없습니다." >&2
+        return 1
+    fi
+
+    timeout_bin="$(command -v timeout 2>/dev/null || true)"
+
+    rm -rf "$chunk_dir"
+    mkdir -p "$chunk_dir"
+
+    split -d -a 5 -l "$chunk_size" \
+        "$host_file" \
+        "$chunk_dir/chunk_"
+
+    for chunk_file in "$chunk_dir"/chunk_*; do
+        [[ -s "$chunk_file" ]] || continue
+
+        chunk_targets="$(paste -sd, "$chunk_file")"
+
+        set +e
+
+        if [[ -n "$timeout_bin" ]]; then
+            "$timeout_bin" \
+                --signal=TERM \
+                --kill-after=2 \
+                "${hard_timeout}s" \
+                "$salt_bin" \
+                -t "$salt_timeout" \
+                --out=json \
+                --static \
+                -L "$chunk_targets" \
+                "saltutil.${function_name}" "$jid" \
+                > "${chunk_file}.out" \
+                2> "${chunk_file}.err"
+            rc=$?
+        else
+            "$salt_bin" \
+                -t "$salt_timeout" \
+                --out=json \
+                --static \
+                -L "$chunk_targets" \
+                "saltutil.${function_name}" "$jid" \
+                > "${chunk_file}.out" \
+                2> "${chunk_file}.err"
+            rc=$?
+        fi
+
+        set -e
+
+        : "$rc"
+    done
+
+    return 0
+}
+
+
+jid_kill_one() {
+    local jid="$1"
+    local targets="$2"
+    local work_dir="$3"
+    local job="$4"
+    local type_name="$5"
+    local label="$6"
+    local target_count="$7"
+    local function_name="${8:-}"
+
+    local jid_dir="$work_dir/jid_$jid"
+    local before_dir="$jid_dir/before"
+    local after_term_dir="$jid_dir/after_term"
+    local final_dir="$jid_dir/final"
+    local unknown_file="$jid_dir/unknown"
+
+    local active_before=0
+    local unknown_before=0
+    local active_after_term=0
+    local active_final=0
+    local unknown_total=0
+
+    local after_term_targets=""
+    local final_targets=""
+
+    local term_wait="${CANCEL_TERM_WAIT:-2}"
+    local kill_wait="${CANCEL_KILL_WAIT:-1}"
+
+    mkdir -p "$jid_dir"
+
+    if ! jid_query_find_state \
+        "$jid" \
+        "$targets" \
+        "$before_dir"
+    then
+        return 3
+    fi
+
+    active_before="$(wc -l < "$before_dir/active")"
+    unknown_before="$(wc -l < "$before_dir/unknown")"
+
+    # 실행 중인 대상 없음
+    if (( active_before == 0 )); then
+        if (( unknown_before > 0 )); then
+            return 3
+        fi
+
+        return 2
+    fi
+
+    # --------------------------------------------------------
+    # TERM
+    # --------------------------------------------------------
+    jid_kill_signal_hosts \
+        "$jid" \
+        "$before_dir/active" \
+        "term_job" \
+        "$jid_dir"
+
+    sleep "$term_wait"
+
+    after_term_targets="$(
+        paste -sd, "$before_dir/active" 2>/dev/null || true
+    )"
+
+    jid_query_find_state \
+        "$jid" \
+        "$after_term_targets" \
+        "$after_term_dir"
+
+    active_after_term="$(wc -l < "$after_term_dir/active")"
+
+    # --------------------------------------------------------
+    # TERM 이후에도 실행 중이면 KILL
+    # --------------------------------------------------------
+    if (( active_after_term > 0 )); then
+        jid_kill_signal_hosts \
+            "$jid" \
+            "$after_term_dir/active" \
+            "kill_job" \
+            "$jid_dir"
+
+        sleep "$kill_wait"
+    fi
+
+    final_targets="$(
+        paste -sd, "$after_term_dir/active" 2>/dev/null || true
+    )"
+
+    jid_query_find_state \
+        "$jid" \
+        "$final_targets" \
+        "$final_dir"
+
+    active_final="$(wc -l < "$final_dir/active")"
+
+    {
+        cat "$before_dir/unknown" 2>/dev/null
+        cat "$after_term_dir/unknown" 2>/dev/null
+        cat "$final_dir/unknown" 2>/dev/null
+    } |
+        sed '/^[[:space:]]*$/d' |
+        sort -u \
+        > "$unknown_file"
+
+    unknown_total="$(wc -l < "$unknown_file")"
+
+    if [[ "${JID_KILL_HEADER_PRINTED:-0}" -eq 0 ]]; then
+        echo "[ Sage JID 강제 중단 ]"
+        echo
+        JID_KILL_HEADER_PRINTED=1
+    else
+        echo
+    fi
+
+    printf 'JID      : %s\n' "$jid"
+    printf 'JOB      : %s\n' "$job"
+    printf 'TYPE     : %s\n' "$type_name"
+
+    if [[ "${label:--}" != "-" ]]; then
+        printf 'LABEL    : %s\n' "$label"
+    fi
+
+    if [[ -n "$function_name" && "$type_name" == "-" ]]; then
+        printf 'FUNCTION : %s\n' "$function_name"
+    fi
+
+    if (( active_final > 0 )); then
+        echo "STATUS   : RUNNING"
+        printf 'RUNNING  : %s대\n' "$active_final"
+
+    elif (( unknown_total > 0 )); then
+        echo "STATUS   : UNKNOWN"
+        printf 'UNKNOWN  : %s대\n' "$unknown_total"
+
+    else
+        echo "STATUS   : STOPPED"
+    fi
+
+    if [[ "$target_count" =~ ^[0-9]+$ ]]; then
+        printf 'TARGETS  : %s대\n' "$target_count"
+    fi
+
+    if (( active_final > 0 || unknown_total > 0 )); then
+        return 1
+    fi
+
+    # Sage JID인 경우에만 취소 완료 history를 기록한다.
+    # 임의의 일반 Salt JID(-K <JID>)는 sage_history에 넣지 않는다.
+    case "$type_name" in
+        MAIN)
+            append_sage_jid_history \
+                "$jid" "main" "-" "$target_count" "130" "" "$job"
+            ;;
+        JID_CHUNK)
+            append_sage_jid_history \
+                "$jid" "chunk" "$label" "$target_count" "130" "" "$job"
+            ;;
+        FILE_DEPLOY)
+            append_sage_jid_history \
+                "$jid" "file_deploy" "$label" "$target_count" "130" "" "$job"
+            ;;
+    esac
+
+    return 0
+}
+
+
+jid_kill_current_job() {
+    local work_dir="$1"
+
+    local job_dir="$(pwd -P)"
+    local registry_file="$job_dir/log/jid_registry"
+    local lock_file="$job_dir/.run.lock"
+    local tmp_dir="$job_dir/.tmp"
+    local pending_file="$tmp_dir/async_pending"
+    local protect_marker="$tmp_dir/jid_registering"
+    local cancel_marker="$tmp_dir/cancelled"
+
+    local records_file="$work_dir/registry_records"
+
+    local controller_running=0
+    local cancel_marker_created=0
+    local run_id="external-K"
+
+    local record_run_id=""
+    local context=""
+    local label=""
+    local jid=""
+    local target_count=""
+    local targets=""
+    local type_name=""
+
+    local rc=0
+    local kill_count=0
+    local fail_count=0
+    local unknown_count=0
+    local i=0
+
+    # --------------------------------------------------------
+    # Sage 본체가 실행 중인지 확인
+    # --------------------------------------------------------
+    if jid_kill_run_lock_held "$lock_file"; then
+        controller_running=1
+    fi
+
+    # --------------------------------------------------------
+    # 현재 run_id 확인
+    # --------------------------------------------------------
+    if [[ -s "$registry_file" ]]; then
+        run_id="$(
+            awk -F '\t' '
+                $1 != "" {
+                    run_id=$1
+                }
+                END {
+                    if (run_id != "")
+                        print run_id
+                }
+            ' "$registry_file"
+        )"
+    elif [[ -s "$pending_file" ]]; then
+        IFS=$'\t' read -r run_id _rest < "$pending_file" || true
+    fi
+
+    [[ -n "$run_id" ]] || run_id="external-K"
+
+    # --------------------------------------------------------
+    # 현재 Sage가 실행 중이거나 ASYNC_RESULT가 수집 중이면
+    # cancelled marker를 먼저 만든다.
+    #
+    # 이렇게 해야 FILE_DEPLOY -> REMOTE 사이의 JID 없는 구간에서도
+    # 다음 JID 제출을 차단할 수 있다.
+    # --------------------------------------------------------
+    if (( controller_running == 1 )) || [[ -s "$pending_file" ]]; then
+        mkdir -p "$tmp_dir"
+
+        if [[ ! -s "$cancel_marker" ]]; then
+            printf '%s\trun_id=%s\tsignal=EXTERNAL_K\n' \
+                "$(date '+%F %T')" \
+                "$run_id" \
+                > "$cancel_marker"
+        fi
+
+        cancel_marker_created=1
+
+        # JID가 발급되어 registry 기록 중이면 완료까지 잠시 기다린다.
+        for ((i=0; i<100; i++)); do
+            [[ ! -e "$protect_marker" ]] && break
+            sleep 0.1
+        done
+    fi
+
+    # --------------------------------------------------------
+    # marker 생성 이후 registry snapshot
+    # --------------------------------------------------------
+    if [[ -s "$registry_file" ]]; then
+        awk -F '\t' '
+            $4 ~ /^[0-9]+$/ &&
+            $6 != "" &&
+            !seen[$4]++ {
+                print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6
+            }
+        ' "$registry_file" |
+            tac \
+            > "$records_file"
+    else
+        : > "$records_file"
+    fi
+
+    while IFS=$'\t' read -r \
+        record_run_id \
+        context \
+        label \
+        jid \
+        target_count \
+        targets
+    do
+        [[ "$jid" =~ ^[0-9]+$ ]] || continue
+        [[ -n "$targets" ]] || continue
+
+        type_name="$(jid_query_format_type "$context")"
+
+        if jid_kill_one \
+            "$jid" \
+            "$targets" \
+            "$work_dir" \
+            "$job_dir" \
+            "$type_name" \
+            "$label" \
+            "$target_count" \
+            ""
+
+		then
+		    rc=0
+		else
+		    rc=$?
+		fi
+
+        case "$rc" in
+            0)
+                kill_count=$((kill_count + 1))
+                ;;
+            1)
+                kill_count=$((kill_count + 1))
+                fail_count=$((fail_count + 1))
+                ;;
+            2)
+                ;;
+            3)
+                unknown_count=$((unknown_count + 1))
+                ;;
+        esac
+
+    done < "$records_file"
+
+    # --------------------------------------------------------
+    # ASYNC_RESULT는 Sage 프로세스가 이미 종료된 상태일 수 있다.
+    #
+    # 이 경우에는 cleanup을 실행할 Sage가 없으므로,
+    # 모든 JID 종료가 확인됐다면 여기서 .tmp를 정리한다.
+    # --------------------------------------------------------
+    if (( controller_running == 0 )) &&
+       (( cancel_marker_created == 1 )) &&
+       (( fail_count == 0 )) &&
+       (( unknown_count == 0 ))
+    then
+        rm -rf "$tmp_dir"
+
+        if [[ "$run_id" != "external-K" ]]; then
+            rm -rf "$apply_dir/sage_file_deploy/$run_id"
+            rmdir "$apply_dir/sage_file_deploy" 2>/dev/null || true
+        fi
+    fi
+
+    if (( kill_count > 0 )); then
+        echo
+        printf '중단 처리 JID : %s개\n' "$kill_count"
+
+        if (( fail_count > 0 )); then
+            printf '종료 미확인 JID : %s개\n' "$fail_count"
+        fi
+
+        if (( unknown_count > 0 )); then
+            printf '상태 미확인 JID : %s개\n' "$unknown_count"
+        fi
+
+        if (( fail_count > 0 || unknown_count > 0 )); then
+            return 1
+        fi
+
+        return 0
+    fi
+
+    # JID는 없지만 Sage controller가 살아 있는 공백 구간
+    if (( controller_running == 1 )); then
+        echo "Sage 취소 요청을 등록했습니다."
+        echo "후속 Salt JID 제출을 차단합니다."
+        return 0
+    fi
+
+    if (( unknown_count > 0 )); then
+        echo "Sage JID 상태를 확인할 수 없습니다."
+        printf '상태 미확인 JID : %s개\n' "$unknown_count"
+        return 1
+    fi
+
+    echo "실행 중인 Sage JID가 없습니다."
+    return 0
+}
+
+
+jid_kill_specific() {
+    local jid="$1"
+    local work_dir="$2"
+
+    local current_registry="$(pwd -P)/log/jid_registry"
+
+    local registry_record=""
+    local history_record=""
+
+    local context=""
+    local registry_label=""
+    local registry_target_count=""
+    local _jid=""
+
+    local label="-"
+    local target_count="?"
+    local targets=""
+
+    local job="-"
+    local type_name="-"
+    local function_name=""
+
+    local history_type="-"
+    local history_label="-"
+    local history_targets="?"
+    local history_rc="?"
+
+    local cache_json="$work_dir/job_cache.json"
+    local cache_err="$work_dir/job_cache.err"
+    local cache_info_file="$work_dir/cache_info"
+    local cache_parse_rc=0
+    local -a cache_info=()
+
+    local rc=0
+
+    # history 정보
+    history_record="$(
+        jid_query_get_history_record \
+            "$jid" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$history_record" ]]; then
+        IFS=$'\t' read -r \
+            job \
+            history_type \
+            history_label \
+            history_targets \
+            history_rc <<< "$history_record"
+
+        type_name="$history_type"
+        label="$history_label"
+
+        if [[ "$history_targets" =~ ^[0-9]+$ ]]; then
+            target_count="$history_targets"
+        fi
+    fi
+
+    # 현재 작업 registry
+    registry_record="$(
+        jid_query_get_registry_record \
+            "$current_registry" \
+            "$jid" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$registry_record" ]]; then
+        IFS=$'\t' read -r \
+            context \
+            registry_label \
+            _jid \
+            registry_target_count \
+            targets <<< "$registry_record"
+
+        if [[ "$job" == "-" ]]; then
+            job="$(pwd -P)"
+        fi
+
+        if [[ "$type_name" == "-" ]]; then
+            type_name="$(jid_query_format_type "$context")"
+        fi
+
+        if [[ "$label" == "-" && -n "$registry_label" ]]; then
+            label="$registry_label"
+        fi
+
+        if [[ "$target_count" == "?" &&
+              "$registry_target_count" =~ ^[0-9]+$ ]]
+        then
+            target_count="$registry_target_count"
+        fi
+
+    else
+        # 현재 디렉토리 registry에 없으면 master job cache에서 대상 조회
+        if ! jid_query_get_job_cache_info \
+            "$jid" \
+            "$cache_json" \
+            "$cache_err"
+        then
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+        fi
+
+        set +e
+
+        jid_query_parse_job_cache_info \
+            "$cache_json" \
+            > "$cache_info_file"
+
+        cache_parse_rc=$?
+
+        set -e
+
+        if [[ "$cache_parse_rc" -eq 2 ]]; then
+            echo "실행 중인 JID가 아닙니다: $jid"
+            return 0
+        fi
+
+        if [[ "$cache_parse_rc" -ne 0 ]]; then
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+        fi
+
+        mapfile -t cache_info < "$cache_info_file"
+
+        if [[ ${#cache_info[@]} -lt 2 ]]; then
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+        fi
+
+        function_name="${cache_info[0]}"
+        targets="${cache_info[1]}"
+
+        if [[ "$target_count" == "?" ]]; then
+            target_count="$(
+                printf '%s\n' "$targets" |
+                    tr ',' '\n' |
+                    sed '/^$/d' |
+                    sort -u |
+                    wc -l
+            )"
+        fi
+    fi
+
+    if jid_kill_one \
+        "$jid" \
+        "$targets" \
+        "$work_dir" \
+        "$job" \
+        "$type_name" \
+        "$label" \
+        "$target_count" \
+        "$function_name"
+
+	then
+		rc=0
+	else
+		rc=$?
+	fi
+
+    case "$rc" in
+        0)
+            return 0
+            ;;
+        1)
+            return 1
+            ;;
+        2)
+            echo "실행 중인 JID가 아닙니다: $jid"
+            return 0
+            ;;
+        3)
+            echo "JID 상태를 확인할 수 없습니다: $jid"
+            return 1
+            ;;
+    esac
+
+    return 1
+}
+
+
+run_jid_kill_mode() {
+    local jid="${1:-}"
+    local work_dir=""
+    local rc=0
+
+    work_dir="$(mktemp -d /tmp/sage_jid_kill.XXXXXX)"
+
+    JID_KILL_HEADER_PRINTED=0
+
+	if [[ -n "$jid" ]]; then
+	    if jid_kill_specific "$jid" "$work_dir"; then
+	        rc=0
+	    else
+	        rc=$?
+	    fi
+	else
+	    if jid_kill_current_job "$work_dir"; then
+	        rc=0
+	    else
+	        rc=$?
+	    fi
+	fi
+
+    rm -rf -- "$work_dir"
+
+    return "$rc"
+}
+
 # ============================================================
 # 실행 옵션 처리
 # ============================================================
@@ -247,6 +2084,25 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        -j|--jid)
+            JID_QUERY_MODE=1
+            # 다음 값이 옵션이 아니면 JID로 사용한다.
+            # 생략하면 현재 작업 디렉토리의 jid_registry를 조회한다.
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                JID_QUERY_VALUE="$2"
+                shift
+            fi
+            ;;
+        -K|--kill-jid)
+            JID_KILL_MODE=1
+
+            # 생략하면 현재 작업 전체 취소
+            # JID가 있으면 해당 JID만 중단
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                JID_KILL_VALUE="$2"
+                shift
+            fi
+            ;;
         -h|--help)
             print_usage
             exit 0
@@ -265,6 +2121,60 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# ============================================================
+# -K / --kill-jid 처리
+# ============================================================
+if [[ "$JID_QUERY_MODE" -eq 1 && "$JID_KILL_MODE" -eq 1 ]]; then
+    echo "-j/--jid와 -K/--kill-jid는 같이 사용할 수 없습니다."
+    exit 1
+fi
+
+if [[ "$JID_KILL_MODE" -eq 1 ]]; then
+    if [[ "$INIT_MODE" -eq 1 ||
+          "$AUTO_YES" -eq 1 ||
+          "$KEEP_TMP" -eq 1 ||
+          "$CLI_DEBUG" -eq 1 ||
+          -n "$target_path" ]]
+    then
+        echo "-K/--kill-jid 옵션은 일반 실행 옵션 또는 작업 경로와 같이 사용할 수 없습니다."
+        exit 1
+    fi
+
+    if [[ "$JID_KILL_VALUE" == "all" ]]; then
+        echo "-K all은 지원하지 않습니다."
+        exit 1
+    fi
+
+    if [[ -n "$JID_KILL_VALUE" &&
+          ! "$JID_KILL_VALUE" =~ ^[0-9]+$ ]]
+    then
+        echo "JID 값이 올바르지 않습니다: $JID_KILL_VALUE"
+        exit 1
+    fi
+
+    run_jid_kill_mode "$JID_KILL_VALUE"
+    exit $?
+fi
+
+# ============================================================
+# -j / --jid 처리: JID 실행 상태 조회 후 종료
+# ============================================================
+if [[ "$JID_QUERY_MODE" -eq 1 ]]; then
+    if [[ "$INIT_MODE" -eq 1 || "$AUTO_YES" -eq 1 || "$KEEP_TMP" -eq 1 || "$CLI_DEBUG" -eq 1 || -n "$target_path" ]]; then
+        echo "-j/--jid 옵션은 일반 실행 옵션 또는 작업 경로와 같이 사용할 수 없습니다."
+        exit 1
+    fi
+
+    if [[ -n "$JID_QUERY_VALUE" && "$JID_QUERY_VALUE" != "all" && ! "$JID_QUERY_VALUE" =~ ^[0-9]+$ ]]; then
+        echo "JID 값이 올바르지 않습니다: $JID_QUERY_VALUE"
+        echo "사용 가능 값: 숫자 JID, all"
+        exit 1
+    fi
+
+    run_jid_query_mode "$JID_QUERY_VALUE"
+    exit $?
+fi
 
 # ============================================================
 # -i / --init 처리: 신규 작업 디렉토리 생성 후 종료
@@ -1300,6 +3210,18 @@ sage_cancel_one_jid() {
             "file_deploy_stage_keep jid=$jid unconfirmed=$(wc -l < "$unconfirmed_file")"
     fi
 
+    # 최초에 실제 RUNNING이었고, 취소 후 종료 상태가 모두 확인된 경우에만
+    # CANCELLED history를 남긴다.
+    if (( active_before > 0 )) && [[ ! -s "$unconfirmed_file" ]]; then
+        if [[ "${CANCEL_SIGNAL:-INT}" == "TERM" ]]; then
+            append_sage_jid_history \
+                "$jid" "$context" "$label" "$target_count" "143"
+        else
+            append_sage_jid_history \
+                "$jid" "$context" "$label" "$target_count" "130"
+        fi
+    fi
+
     return 0
 }
 
@@ -1528,9 +3450,11 @@ cleanup() {
         rm -f "$lock_file"
     fi
 
-	if [[ "${CANCEL_REQUESTED:-0}" -eq 1 ]]; then
+	if [[ "${CANCEL_REQUESTED:-0}" -eq 1 ||
+		  -s "${SAGE_CANCEL_MARKER:-$tmp_dir/cancelled}" ]]
+	then
 	    rm -rf "$tmp_dir"
-	
+
 	elif [[ "${ASYNC_RESULT_HANDOFF:-0}" -eq 1 ]]; then
 	    if [[ "$KEEP_TMP" -eq 1 ]]; then
 	        echo "[DEBUG] tmp 유지: $tmp_dir"
@@ -2585,154 +4509,6 @@ run_user_local() {
 }
 
 # ============================================================
-# Salt JID 발급 시각 변환
-#
-# Salt JID 앞 14자리:
-#   YYYYMMDDHHMMSS
-#
-# 현재 환경의 Salt JID는 UTC 기준으로 생성되므로
-# Asia/Seoul 시각으로 변환해 반환한다.
-# ============================================================
-__sage_jid_history_time() {
-    local jid="${1:-}"
-    local jid_utc=""
-
-    if [[ "$jid" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
-        jid_utc="$(
-            printf '%s-%s-%s %s:%s:%s UTC' \
-                "${BASH_REMATCH[1]}" \
-                "${BASH_REMATCH[2]}" \
-                "${BASH_REMATCH[3]}" \
-                "${BASH_REMATCH[4]}" \
-                "${BASH_REMATCH[5]}" \
-                "${BASH_REMATCH[6]}"
-        )"
-
-        TZ=Asia/Seoul date -d "$jid_utc" '+%F %T' 2>/dev/null && return 0
-    fi
-
-    date '+%F %T'
-}
-
-append_sage_jid_history() {
-    local jid="${1:-}"
-    local context="${2:-}"
-    local label="${3:-}"
-    local target_count="${4:-unknown}"
-    local rc="${5:-unknown}"
-
-    local history_dir="/var/log/salt"
-    local history_log="$history_dir/sage_history.log"
-    local history_lock="${history_log}.lock"
-    local history_time=""
-    local history_job="${SAGE_JOB_DIR:-$base_dir}"
-
-    [[ "$jid" =~ ^[0-9]+$ ]] || return 0
-
-    # context를 따로 넘기지 않으면 현재 salt_apply 실행 상태로 판단한다.
-    if [[ -z "$context" ]]; then
-        if [[ "${SALT_APPLY_CONTEXT:-default}" == "file_deploy" ]]; then
-            context="file_deploy"
-            label="${SAGE_FILE_DEPLOY_LABEL:-0000}:${JID_CHUNK_LABEL:-0/0}"
-        elif [[ "${JID_CHUNK_ACTIVE:-0}" == "1" ]]; then
-            context="chunk"
-            label="${JID_CHUNK_LABEL:-0/0}"
-        else
-            context="main"
-            label="-"
-        fi
-    fi
-
-    [[ -n "$label" ]] || label="-"
-    [[ -n "$target_count" ]] || target_count="unknown"
-
-    history_time="$(
-        __sage_jid_history_time "$jid"
-    )"
-
-	mkdir -p "$history_dir" 2>/dev/null || return 0
-	
-	(
-	    flock -x 200
-	
-	    # 같은 JID는 history에 한 번만 기록한다.
-	    if [[ -s "$history_log" ]] &&
-	        grep -Fq -- $'\tJID: '"$jid"$'\t' "$history_log"
-	    then
-	        exit 0
-	    fi
-	
-		case "$context" in
-		    file_deploy)
-		        printf '%s\tJOB: %s\tTYPE: FILE_DEPLOY\tLABEL: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
-		            "$history_time" \
-		            "$history_job" \
-		            "$label" \
-		            "$jid" \
-		            "$target_count" \
-		            "$rc" \
-		            >> "$history_log"
-		        ;;
-		
-		    chunk)
-		        printf '%s\tJOB: %s\tTYPE: JID_CHUNK\tLABEL: %s\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
-		            "$history_time" \
-		            "$history_job" \
-		            "$label" \
-		            "$jid" \
-		            "$target_count" \
-		            "$rc" \
-		            >> "$history_log"
-		        ;;
-		
-		    main)
-		        printf '%s\tJOB: %s\tTYPE: MAIN\tLABEL: -\tJID: %s\tTARGETS: %s\tSALT_RC: %s\n' \
-		            "$history_time" \
-		            "$history_job" \
-		            "$jid" \
-		            "$target_count" \
-		            "$rc" \
-		            >> "$history_log"
-		        ;;
-		esac
-	
-	) 200>"$history_lock" 2>/dev/null || true
-	
-	return 0
-
-}
-
-# ============================================================
-# sage Salt 실행 히스토리 최종 요약
-# ============================================================
-# 각 JID 상세 이력은 salt_apply에서 해당 JID 처리 완료 직후
-# append_sage_jid_history()로 즉시 기록한다.
-#
-# 이 함수는 메인 JID 청크 실행의 최종 SUMMARY만 기록한다.
-# 일반 실행과 file_deploy 상세 JID는 여기서 재기록하지 않는다.
-# ============================================================
-write_sage_history() {
-    local history_dir="/var/log/salt"
-    local history_log="$history_dir/sage_history.log"
-    local history_rc="${SALT_RC:-unknown}"
-
-    [[ "${SAGE_JID_CHUNK_USED:-0}" -eq 1 ]] || return 0
-
-    {
-        mkdir -p "$history_dir"
-
-        printf '%s\tJOB: %s\tTYPE: JID_CHUNK_SUMMARY\tLABEL: %s/%s\tJID: -\tTARGETS: %s\tSALT_RC: %s\n' \
-            "$(date '+%F %T')" \
-            "${SAGE_JOB_DIR:-$base_dir}" \
-            "${SAGE_JID_CHUNK_DONE:-unknown}" \
-            "${SAGE_JID_CHUNK_TOTAL:-unknown}" \
-            "${SAGE_JID_CHUNK_TOTAL_TARGETS:-${server_count:-unknown}}" \
-            "$history_rc" \
-            >> "$history_log"
-    } 2>/dev/null || true
-}
-
-# ============================================================
 # 이전 실행 결과 파일 정리
 # ============================================================
 rm -f "$log_dir/server_fail" "$log_dir/log_salt"
@@ -3248,10 +5024,6 @@ case "$answer" in
 		sage_print_section "$salt_section_title"
 				
 		. "$framework_dir/salt_apply"
-
-        # sage 실행 히스토리 기록
-        # salt_apply 실행 후 메인 JID 청크 SUMMARY가 필요하면 기록한다.
-        write_sage_history
 
         if [[ "${SALT_RC:-1}" -ne 0 ]]; then
             echo
