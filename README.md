@@ -77,8 +77,11 @@ CLI 옵션:
 | `--keep-tmp` | 종료 후 `.tmp` 디렉토리를 삭제하지 않습니다. 디버깅용입니다. |
 | `-d`, `--debug` | `log/debug.log` 기록과 터미널 debug 출력을 켭니다. |
 | `-i`, `--init <작업경로>` | `/data/salt/common/sample`을 복사해 새 작업 디렉토리를 만듭니다. |
-| `-j`, `--jid [JID\|all]` | 실행 중인 Sage/Salt JID 상태를 조회합니다. |
-| `-K`, `--kill-jid [JID]` | 실행 중인 Sage JID 또는 지정 JID를 중단합니다. |
+| `-j`, `--jid` | 현재 작업 경로의 실행 중 Sage JID를 조회합니다. |
+| `-j <JID>`, `--jid <JID>` | 지정한 JID의 현재 실행 상태를 조회합니다. |
+| `-j all`, `--jid all` | master의 전체 실행 중 Salt JID를 조회합니다. |
+| `-K`, `--kill-jid` | 현재 작업 경로의 실행 중 Sage JID를 중단합니다. |
+| `-K <JID>`, `--kill-jid <JID>` | 지정한 JID를 중단합니다. |
 | `-h`, `--help` | 사용법을 출력합니다. |
 
 JID 조회:

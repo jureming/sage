@@ -92,13 +92,13 @@ print_usage() {
   -i, --init <경로>    sample을 복사해 작업 디렉토리 생성
 
 조회:
-  -j                   현재 작업 경로의 실행 중 Sage JID 조회
-  -j <JID>             지정한 JID의 현재 실행 상태 조회
-  -j all               master의 전체 실행 중 Salt JID 조회
+  -j, --jid             현재 작업 경로의 실행 중 Sage JID 조회
+  -j, --jid <JID>       지정한 JID의 현재 실행 상태 조회
+  -j, --jid all         master의 전체 실행 중 Salt JID 조회
 
 중단:
-  -K                   현재 작업 경로의 실행 중 Sage JID 중단
-  -K <JID>             지정한 JID 중단
+  -K, --kill-jid        현재 작업 경로의 실행 중 Sage JID 중단
+  -K, --kill-jid <JID>  지정한 JID 중단
 
 기타:
   -h, --help           도움말 출력
