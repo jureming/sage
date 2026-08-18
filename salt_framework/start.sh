@@ -2036,6 +2036,8 @@ jid_kill_specific() {
 run_jid_kill_mode() {
     local jid="${1:-}"
     local work_dir=""
+    local pending_file=""
+    local pending_jid=""
     local rc=0
 
     work_dir="$(mktemp -d /tmp/sage_jid_kill.XXXXXX)"
@@ -2043,11 +2045,26 @@ run_jid_kill_mode() {
     JID_KILL_HEADER_PRINTED=0
 
 	if [[ -n "$jid" ]]; then
-	    if jid_kill_specific "$jid" "$work_dir"; then
-	        rc=0
-	    else
-	        rc=$?
-	    fi
+        pending_file="$(pwd -P)/.tmp/async_pending"
+        pending_jid=""
+
+        if [[ -s "$pending_file" ]]; then
+            pending_jid="$(awk -F '\t' 'NR == 1 {print $4}' "$pending_file")"
+        fi
+
+        if [[ "$pending_jid" == "$jid" ]]; then
+            if jid_kill_current_job "$work_dir"; then
+                rc=0
+            else
+                rc=$?
+            fi
+        else
+            if jid_kill_specific "$jid" "$work_dir"; then
+                rc=0
+            else
+                rc=$?
+            fi
+        fi
 	else
 	    if jid_kill_current_job "$work_dir"; then
 	        rc=0
