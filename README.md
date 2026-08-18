@@ -26,7 +26,7 @@
   remote
   post
 
-/data/salt/manual/<분류>/<작업명>/
+/data/salt/{manual,shared,cron}/<분류>/<작업명>/
   config
   pre
   server
